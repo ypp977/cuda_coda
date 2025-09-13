@@ -1,0 +1,8 @@
+add_executable(softmax softmax_naive.cu)
+add_executable(shuffle shuffle.cu)
+add_executable(shuffle_up shuffle_up.cu)
+add_executable(shuffle_down shuffle_down.cu)
+target_link_libraries(softmax PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(shuffle PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(shuffle_up PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(shuffle_down PRIVATE ${CUDA_LIBRARIES})

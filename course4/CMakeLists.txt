@@ -1,0 +1,11 @@
+add_executable(reduce reduce.cu)
+add_executable(reducev1 reduce_v1.cu)
+add_executable(reducev2 reduce_v2.cu)
+add_executable(reducev3 reduce_v3.cu)
+add_executable(reducev4 reduce_v4.cu)
+
+target_link_libraries(reduce PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(reducev1 PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(reducev2 PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(reducev3 PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(reducev4 PRIVATE ${CUDA_LIBRARIES})

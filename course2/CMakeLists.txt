@@ -1,0 +1,6 @@
+add_executable(malloc_cpy malloc_cpy.cu)
+add_executable(reduce_smem reduce_smem.cu)
+add_executable(vec_add vec_add.cu)
+target_link_libraries(malloc_cpy PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(reduce_smem PRIVATE ${CUDA_LIBRARIES})
+target_link_libraries(vec_add PRIVATE ${CUDA_LIBRARIES})

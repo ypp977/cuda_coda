@@ -1,0 +1,13 @@
+add_executable(matmul0 matmul0.cu)
+add_executable(matmul1 matmul1.cu)
+add_executable(matmul2 matmul2.cu)
+add_executable(matmul3 matmul3.cu)
+add_executable(matmul4 matmul4.cu)
+add_executable(matmul5 matmul5.cu)
+
+target_link_libraries(matmul0 PRIVATE ${CUDA_LIBRARIES} cublas)
+target_link_libraries(matmul4 PRIVATE ${CUDA_LIBRARIES} cublas)
+target_link_libraries(matmul1 PRIVATE ${CUDA_LIBRARIES} cublas)
+target_link_libraries(matmul2 PRIVATE ${CUDA_LIBRARIES} cublas)
+target_link_libraries(matmul3 PRIVATE ${CUDA_LIBRARIES} cublas)
+target_link_libraries(matmul5 PRIVATE ${CUDA_LIBRARIES} cublas)
