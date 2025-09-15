@@ -14,6 +14,7 @@ set(CMAKE_CUDA_FLAGS_DEBUG "-G -O0")
 # 自动扫描所有课程目录下的 .cu 文件
 file(GLOB_RECURSE COURSE_SOURCES
     course1/*.cu
+    course2/*.cu
 )
 
 foreach(src ${COURSE_SOURCES})

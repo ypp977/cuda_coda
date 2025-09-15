@@ -1,26 +1,46 @@
-#include <cstdio>
-#include <cstdlib>
 #include <cuda_runtime.h>
+#include <stdio.h>
 
-int main() {
-  int size = 4 * sizeof(int);
-  int *h_a = (int *)malloc(size);
-  int *h_b = (int *)malloc(size);
-  int *d_a;
+int main()
+{
+    // 数组大小
+    int N = 4;
+    // 数组所占字节数
+    size_t size = N * sizeof(int);
 
-  for (int i = 0; i < 4; i++) {
-    h_a[i] = i;
-  }
-  cudaMalloc((void **)&d_a, size);
-  cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice);
+    // 在CPU端分配内存
+    int *host_a, *host_b;
+    host_a = (int*)malloc(size);
+    host_b = (int*)malloc(size);
 
-  cudaMemcpy(h_b, d_a, size, cudaMemcpyDeviceToHost);
-  for (int i = 0; i < 4; ++i) {
-    printf("h_b[%d] = %d\n", i, h_b[i]);
-  }
+    // 初始化 host_a 数组
+    for (int i = 0; i < N; i++)
+    {
+        host_a[i] = i;
+    }
 
-  cudaFree(d_a);
-  free(h_a);
-  free(h_b);
-  return 0;
+    // 在GPU端分配内存
+    int* device_a;
+    cudaMalloc(&device_a, size);
+
+    // 将CPU上的 host_a 数组内容拷贝到GPU的  device_a
+    cudaMemcpy(device_a, host_a, size, cudaMemcpyHostToDevice);
+
+    // 将 GPU 上的 device_a 数组内容再拷贝回CPU的 host_b
+    cudaMemcpy(host_b, device_a, size, cudaMemcpyDeviceToHost);
+
+    // 打印 host_b 的内容，检查数据是否正确
+    for (int i = 0; i < N; i++)
+    {
+        printf("host_b[%d] = %d\n", i, host_b[i]);
+    }
+
+    // 释放 GPU 显存
+    cudaFree(device_a);
+
+    // 释放 CPU 显存
+    free(host_a);
+    free(host_b);
+
+    return 0;
 }

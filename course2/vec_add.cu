@@ -1,65 +1,101 @@
 #include <cstdio>
 
-#define BLOCK_SIZE 16  // 每个 block 包含的线程数
-// 3个线程块，1个块里有32个线程。
-// 0(blockIdx.x) * 32(blockDim.x) + 0(threadIdx.x)
-__global__ void vecAdd(int *A, int *B, int *C, int N) {
-  int i = threadIdx.x + blockIdx.x * blockDim.x;
-  if (i < N) {
-    int res = A[i] + B[i];
-    printf("A[i] = %d\n", A[i]);
-    C[i] = res;
-  }
+// 定义每个block中包含的线程数
+#define BLOCK_SIZE 256
+
+// blockIdx.x : 当前Block在整个grid内的索引(0 ~ gridDim.x-1)
+// blockDim.x : 每个Block中的线程数
+// threadIdx.x : 线程在当前Block中的索引(0 ~ blockDim.x-1)
+__global__ void vec_add(int* input_a, int* input_b, int* output_c, int N)
+{
+    // 计算当前线程要处理的数据元素下标
+    long i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 判断是否越界：
+    // 线程数通常会 >= N，为了避免访问数组时越界，需要加这个条件判断
+    if (i < N)
+    {
+        // 每个线程只负责处理数组中一个元素
+        // 将 input_a[i] 和 input_b[i] 相加，并存储到 output_c[i]
+        output_c[i] = input_a[i] + input_b[i];
+    }
 }
 
-int main() {
-  int N = 10;  // 大规模数组
-  size_t size = N * sizeof(int);
+int main()
+{
+    // 数组大小
+    int N = 1 << 20; // 1M数据
+    // 数组所占字节数
+    size_t size = N * sizeof(int);
 
-  int *A = (int *)malloc(size);
-  int *B = (int *)malloc(size);
-  int *C = (int *)malloc(size);
+    // 在CPU端分配内存
+    int* host_a = (int*)malloc(size);
+    int* host_b = (int*)malloc(size);
+    int* host_c = (int*)malloc(size);
 
-  for (int i = 0; i < N; i++) {
-    // cpu当中去初始化的
-    A[i] = i;
-    B[i] = i * 2;
-  }
-
-  int *d_A, *d_B, *d_C;
-  // 在GPU上分配显存
-  // d_A指向显存的起始位置
-  cudaMalloc((void **)&d_A, size);
-  cudaMalloc((void **)&d_B, size);
-  cudaMalloc((void **)&d_C, size);
-  // A是指向cpu内存的指针，d_A是指向gpu内存的指针
-  // 将cpu内存中的数据拷贝到gpu内存中
-  cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_B, B, size, cudaMemcpyHostToDevice);
-
-  int numBlocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-  printf("array size:%d\n", N);
-  printf("thread block:%d\n", numBlocks);
-  printf("thread num per block:%d\n", BLOCK_SIZE);
-  vecAdd<<<numBlocks, BLOCK_SIZE>>>(d_A, d_B, d_C, N);
-
-  cudaMemcpy(C, d_C, size, cudaMemcpyDeviceToHost);
-
-  for (int i = 0; i < N; i++) {
-    if (C[i] != A[i] + B[i]) {
-      printf("Error at index %d: Expected %d, Got %d\n", i, A[i] + B[i], C[i]);
-      break;
+    // 初始化数据
+    for (int i = 0; i < N; i++)
+    {
+        host_a[i] = i;
+        host_b[i] = i * 2;
     }
-  }
-  printf("Vector addition completed successfully.\n");
+    // 定义指向GPU显存中的分配数组的空间
+    int *deviece_a, *deviece_b, *deviece_c;
+    // 在GPU显存中分配数组存储空间
+    cudaMalloc(&deviece_a, size);
+    cudaMalloc(&deviece_b, size);
+    cudaMalloc(&deviece_c, size);
+    // 从CPU上的数组拷贝数据到GPU显存中
+    cudaMemcpy(deviece_a, host_a, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(deviece_b, host_b, size, cudaMemcpyHostToDevice);
 
-  free(A);
-  free(B);
-  free(C);
-  cudaFree(d_A);
-  cudaFree(d_B);
-  cudaFree(d_C);
+    // 计算所需Block数量
+    int num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-  return 0;
+    printf("array size :%d\n", N);
+    printf("thread block nums :%d\n", num_blocks);
+    printf("thread num per block :%d\n", BLOCK_SIZE);
+
+    // 启动核函数
+    vec_add<<<num_blocks, BLOCK_SIZE>>>(deviece_a, deviece_b, deviece_c, N);
+    cudaError_t vec_add_err = cudaDeviceSynchronize();
+    if (vec_add_err != cudaSuccess)
+    {
+        printf("cuda kernel lanuch error:%s\n", cudaGetErrorString(vec_add_err));
+        // 释放CPU端内存
+        free(host_a);
+        free(host_b);
+        free(host_c);
+        // 释放GPU端内存
+        cudaFree(deviece_a);
+        cudaFree(deviece_b);
+        cudaFree(deviece_c);
+
+        exit(EXIT_FAILURE);
+    }
+
+    // 从 device 拷贝数据到 Host
+    cudaMemcpy(host_c, deviece_c, size, cudaMemcpyDeviceToHost);
+
+    // 检查结果是否正确
+    for (int i = 0; i < N; i++)
+    {
+        if (host_c[i] != host_a[i] + host_b[i])
+        {
+            printf("Error at index %d ,Except %d ,Got %d\n", i, host_a[i] + host_b[i], host_c[i]);
+            break;
+        }
+    }
+    printf("Vector add complete successfully!\n");
+
+    // 释放CPU端内存
+    free(host_a);
+    free(host_b);
+    free(host_c);
+    // 释放GPU端内存
+    cudaFree(deviece_a);
+    cudaFree(deviece_b);
+    cudaFree(deviece_c);
+
+    return 0;
 }
