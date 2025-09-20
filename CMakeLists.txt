@@ -15,6 +15,7 @@ set(CMAKE_CUDA_FLAGS_DEBUG "-G -O0")
 file(GLOB_RECURSE COURSE_SOURCES
     course1/*.cu
     course2/*.cu
+    course3/*.cu
 )
 
 foreach(src ${COURSE_SOURCES})
