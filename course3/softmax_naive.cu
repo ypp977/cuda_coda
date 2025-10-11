@@ -649,6 +649,5 @@ int main()
     free(out_cpu);
     free(out_gpu);
 
-    // 程序正常退出
     return 0;
 }
