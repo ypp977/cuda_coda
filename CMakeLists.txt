@@ -16,6 +16,7 @@ file(GLOB_RECURSE COURSE_SOURCES
     course1/*.cu
     course2/*.cu
     course3/*.cu
+    course4/*.cu
 )
 
 foreach(src ${COURSE_SOURCES})
