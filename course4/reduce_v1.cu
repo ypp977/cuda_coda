@@ -8,7 +8,7 @@ const int BLOCK_SIZE = 1024; // 每个 block 中的线程数
 const int N = 1024 * 1024;   // 总数据量 (1M 个元素)
 
 // ----------------------- GPU 归约核函数 v1 -----------------------
-__global__ void reduce_v1(double* data_input, double* data_out)
+__global__ void reduce_v1(const double* data_input, double* data_out)
 {
     // 为当前 block 分配共享内存，用于临时存放每个线程的部分和
     __shared__ double temp[BLOCK_SIZE];
@@ -41,7 +41,7 @@ __global__ void reduce_v1(double* data_input, double* data_out)
 }
 
 // ----------------------- CPU 归约函数（验证用） -----------------------
-double reduce_cpu(std::vector<double>& data)
+double reduce_cpu(const std::vector<double>& data)
 {
     // 使用 STL 提供的累加函数
     return std::accumulate(data.begin(), data.end(), 0.0);
