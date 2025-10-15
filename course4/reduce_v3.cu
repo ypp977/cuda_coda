@@ -1,126 +1,124 @@
+#include <chrono>
 #include <cuda_runtime.h>
-
-#include <chrono>  // 用于 CPU 计时
 #include <iostream>
 #include <numeric>
 #include <vector>
 
 const int BLOCK_SIZE = 1024;
-const int N = 1024 * 1024;  // 1M elements
-
+const int N = 1024 * 1024; // 1M elements
 #define FULL_MASK 0xffffffff
-__device__ void warpReduce(float *cache, unsigned int tid) {
-  int v = cache[tid] + cache[tid + 32];
-  v += __shfl_down_sync(FULL_MASK, v, 16);
-  v += __shfl_down_sync(FULL_MASK, v, 8);
-  v += __shfl_down_sync(FULL_MASK, v, 4);
-  v += __shfl_down_sync(FULL_MASK, v, 2);
-  v += __shfl_down_sync(FULL_MASK, v, 1);
-  cache[tid] = v;
+
+// warp 级归约，针对 double 类型
+__device__ double warpReduceSum(double val)
+{
+    // 每次将距离为 offset 的线程值相加，直到warp内只剩下一个结果
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(FULL_MASK, val, offset);
+    return val;
 }
 
-float reduce_cpu(const std::vector<float> &data) {
-  float sum = 0.0f;
-  for (float val : data) {
-    sum += val;
-  }
-  return sum;
+// CPU版本用于验证
+double reduce_cpu(const std::vector<double>& data)
+{
+    return std::accumulate(data.begin(), data.end(), 0.0);
 }
 
-__global__ void reduce_v3(float *g_idata, float *g_odata) {
-  __shared__ float sdata[BLOCK_SIZE];
+// GPU版本：共享内存 + warp归约优化
+__global__ void reduce_v3(const double* data_input, double* data_out)
+{
+    __shared__ double shared_data[BLOCK_SIZE]; // 每个block的共享内存
 
-  // perform first level of reduction,
-  // reading from global memory, writing to shared memory
-  unsigned int tid = threadIdx.x;
-  unsigned int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
-  sdata[tid] = g_idata[i] + g_idata[i + blockDim.x];
-  __syncthreads();
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x * 2 + tid;
 
-  // do reduction in shared mem
-  for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
+    // 每个线程加载两个元素
+    shared_data[tid] = data_input[i] + data_input[i + blockDim.x];
     __syncthreads();
-  }
 
-  // write result for this block to global mem
-  if (tid < 32) warpReduce(sdata, tid);
-  if (tid == 0) g_odata[blockIdx.x] = sdata[0];
+    // block内的前半部分线程归约共享内存中的数据
+    for (int s = blockDim.x / 2; s > 32; s >>= 1)
+    {
+        if (tid < s)
+        {
+            shared_data[tid] += shared_data[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // 剩下最后一个warp时，用warp shuffle做最后的快速归约
+    double val = shared_data[tid];
+    if (tid < 32)
+    {
+        val = warpReduceSum(val);
+    }
+
+    // 将结果写回
+    if (tid == 0)
+    {
+        data_out[blockIdx.x] = val;
+    }
 }
 
-int main() {
-  int num_blocks = ((N + BLOCK_SIZE - 1) / BLOCK_SIZE) / 2;
+int main()
+{
+    int num_blocks = ((N + BLOCK_SIZE - 1) / BLOCK_SIZE) / 2;
 
-  std::vector<float> h_data(N);
+    std::vector<double> host_data(N);
+    std::iota(host_data.begin(), host_data.end(), 1.0); // 生成1~N的序列
 
-  for (int i = 0; i < N; i++) {
-    h_data[i] = 1.0f;  // 简单起见，全部初始化为1.0
-  }
+    // ---- CPU计算 ----
+    auto cpu_start = std::chrono::high_resolution_clock::now();
+    double cpu_result = reduce_cpu(host_data);
+    auto cpu_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> cpu_duration = cpu_end - cpu_start;
 
-  // -------------------------------
-  // CPU 计时开始
-  auto cpu_start = std::chrono::high_resolution_clock::now();
+    std::cout << "CPU result: " << cpu_result << std::endl;
+    std::cout << "CPU time: " << cpu_duration.count() << " ms" << std::endl;
 
-  float cpu_result = reduce_cpu(h_data);
+    // ---- GPU计算 ----
+    double *device_input, *device_output, *device_final_output;
+    double gpu_result;
 
-  auto cpu_end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double, std::milli> cpu_duration = cpu_end - cpu_start;
-  // CPU 计时结束
-  // -------------------------------
+    cudaMalloc(&device_input, N * sizeof(double));
+    cudaMalloc(&device_output, num_blocks * sizeof(double));
+    cudaMalloc(&device_final_output, sizeof(double));
 
-  std::cout << "CPU result: " << cpu_result << std::endl;
-  std::cout << "CPU time: " << cpu_duration.count() << " ms" << std::endl;
+    cudaMemcpy(device_input, host_data.data(), N * sizeof(double), cudaMemcpyHostToDevice);
 
-  float *d_data, *d_result;
-  float *d_final_result;
-  float gpu_result;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-  cudaMalloc(&d_data, N * sizeof(float));
-  cudaMalloc(&d_result, num_blocks * sizeof(float));
-  cudaMalloc(&d_final_result, 1 * sizeof(float));
+    cudaEventRecord(start);
 
-  cudaMemcpy(d_data, h_data.data(), N * sizeof(float), cudaMemcpyHostToDevice);
+    // 两轮归约
+    reduce_v3<<<num_blocks, BLOCK_SIZE>>>(device_input, device_output);
+    reduce_v3<<<1, num_blocks>>>(device_output, device_final_output);
 
-  // -------------------------------
-  // GPU 计时开始 (CUDA Events)
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
-  cudaEventRecord(start);
+    float gpu_time;
+    cudaEventElapsedTime(&gpu_time, start, stop);
 
-  reduce_v3<<<num_blocks, BLOCK_SIZE>>>(d_data, d_result);
-  reduce_v3<<<1, num_blocks>>>(d_result, d_final_result);
+    cudaMemcpy(&gpu_result, device_final_output, sizeof(double), cudaMemcpyDeviceToHost);
 
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
+    // 验证结果
+    if (abs(cpu_result - gpu_result) < 1e-6)
+        std::cout << "GPU result verified SUCCESS" << std::endl;
+    else
+        std::cout << "GPU result verified FAILED" << std::endl;
 
-  float milliseconds = 0;
-  cudaEventElapsedTime(&milliseconds, start, stop);
-  // GPU 计时结束
-  // -------------------------------
+    std::cout << "GPU result: " << gpu_result << std::endl;
+    std::cout << "GPU time: " << gpu_time << " ms" << std::endl;
+    std::cout << "Speedup: " << cpu_duration.count() / gpu_time << "x" << std::endl;
 
-  std::cout << "GPU kernel time: " << milliseconds << " ms" << std::endl;
+    // 清理资源
+    cudaFree(device_input);
+    cudaFree(device_output);
+    cudaFree(device_final_output);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
-  cudaMemcpy(&gpu_result, d_final_result, sizeof(float),
-             cudaMemcpyDeviceToHost);
-  std::cout << "GPU result: " << gpu_result << std::endl;
-
-  if (abs(cpu_result - gpu_result) < 1e-5) {
-    std::cout << "Result verified successfully!" << std::endl;
-  } else {
-    std::cout << "Result verification failed!" << std::endl;
-  }
-
-  // 清理资源
-  cudaFree(d_data);
-  cudaFree(d_result);
-  cudaFree(d_final_result);
-
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
-
-  return 0;
+    return 0;
 }
