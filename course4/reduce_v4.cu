@@ -10,27 +10,31 @@ __inline__ __device__ float block_reduce(float val)
     const int tid = threadIdx.x;
     const int warpSize = 32;
     int lane = tid % warpSize;
-    int warp_id = tid / warpSize;
+    int warpId = tid / warpSize;
 
-    // First level: warp reduce using shuffle
 #pragma unroll
-    for (int offset = warpSize / 2; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
 
-    // Only one warp (warp 0) participates in the second reduction
-    __shared__ float warpSums[32];
+    __shared__ float warp_sum[warpSize];
+
     if (lane == 0)
     {
-        warpSums[warp_id] = val; // Store warp sum in shared memory
+        warp_sum[warpId] = val;
     }
     __syncthreads();
 
-    if (warp_id == 0)
+    if (warpId == 0)
     {
-        val = (tid < blockDim.x / warpSize) ? warpSums[tid] : 0.0f;
+        val = (tid < blockDim.x / warpSize) ? warp_sum[tid] : 0.0f;
+
 #pragma unroll
-        for (int offset = warpSize / 2; offset > 0; offset /= 2)
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
     }
     return val;
 }
@@ -38,12 +42,14 @@ __inline__ __device__ float block_reduce(float val)
 __global__ void reduce_v4(const float* in, float* out, int n)
 {
     float sum = 0.0f;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
     {
         sum += in[i];
     }
 
     sum = block_reduce(sum);
+
     if (threadIdx.x == 0)
     {
         out[blockIdx.x] = sum;
@@ -52,12 +58,7 @@ __global__ void reduce_v4(const float* in, float* out, int n)
 
 float reduce_cpu(const std::vector<float>& data)
 {
-    float sum = 0.0f;
-    for (float val : data)
-    {
-        sum += val;
-    }
-    return sum;
+    return std::accumulate(data.begin(), data.end(), 0.0f);
 }
 
 const int BLOCK_SIZE = 1024;
