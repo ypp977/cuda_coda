@@ -17,9 +17,23 @@ file(GLOB_RECURSE COURSE_SOURCES
     course2/*.cu
     course3/*.cu
     course4/*.cu
+    course5_1/*.cu
 )
 
 foreach(src ${COURSE_SOURCES})
     get_filename_component(target ${src} NAME_WE)
+    get_filename_component(src_dir_name ${src} DIRECTORY)
+
+    # 提取目录名（例如 course1, course2 等）
+    get_filename_component(dir_name ${src_dir_name} NAME)
+
     add_executable(${target} ${src})
+
+    # 设置输出目录为 build/course1, build/course2 等
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${dir_name}"
+    )
+
+    # 关键：链接 cuBLAS 库
+    target_link_libraries(${target} PRIVATE cublas)
 endforeach()
