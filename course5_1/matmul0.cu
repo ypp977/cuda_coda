@@ -137,7 +137,7 @@ int main()
             // -----------------------------
             // (2) cuBLAS 实测部分
             // -----------------------------
-            int repeat_time = 5;
+            int repeat_time = 50;
             checkCudaError(cudaEventRecord(start), "cudaEventRecord(start cublas) failed");
             for (int i = 0; i < repeat_time; i++)
             {
@@ -208,8 +208,9 @@ int main()
             // -----------------------------
             // 理论计算量为 2 * N^3（乘加运算各一次）
             // cublas_time/v1_time 单位是毫秒，因此乘 1e6 转为秒
-            float cublas_gflops = repeat_time * N * N * N * 2.0f / (cublas_time * 1e6f);
-            float v1_gflops = repeat_time * N * N * N * 2.0f / (v1_time * 1e6f);
+            double total_flops = double(repeat_time) * 2.0 * double(N) * double(N) * double(N);
+            double cublas_gflops = total_flops / (double(cublas_time) * 1e6);
+            double v1_gflops = total_flops / (double(v1_time) * 1e6);
 
             // 写入CSV结果
             csv_file << N << "," << cublas_gflops << "," << v1_gflops << ","
