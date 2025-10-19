@@ -15,7 +15,8 @@ void checkCudaError(cudaError_t err, const char *msg) {
   }
 }
 
-void checkCublasError(cublasStatus_t status, const char *msg) {
+void checkCublasError(cublasStatus_t status, const char *msg)
+{
   if (status != CUBLAS_STATUS_SUCCESS) {
     std::cerr << msg << " CUBLAS ERROR: " << status << std::endl;
     exit(EXIT_FAILURE);
