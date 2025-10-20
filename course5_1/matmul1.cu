@@ -8,7 +8,8 @@
 
 #define TOL 1e-5f
 
-void checkCudaError(cudaError_t err, const char *msg) {
+void checkCudaError(cudaError_t err, const char *msg) 
+{
   if (err != cudaSuccess) {
     std::cerr << msg << " CUDA ERROR: " << cudaGetErrorString(err) << std::endl;
     exit(EXIT_FAILURE);
@@ -25,7 +26,8 @@ void checkCublasError(cublasStatus_t status, const char *msg)
 
 template <const int BLOCK_SIZE>
 __global__ void mysgemm_v2(int M, int N, int K, float alpha, float *A, float *B,
-                           float beta, float *C) {
+                           float beta, float *C) 
+{
   int bx = blockIdx.x;
   int by = blockIdx.y;
 
