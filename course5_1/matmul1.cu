@@ -69,7 +69,8 @@ int main()
   std::ofstream csv_file("sgemm_benchmark_v2.csv");
   csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched" << std::endl;
 
-  for (int N : sizes) {
+  for (int N : sizes) 
+  {
     std::cout << "Testing size: " << N << std::endl;
 
     size_t size = N * N * sizeof(float);
