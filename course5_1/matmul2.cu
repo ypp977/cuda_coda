@@ -8,14 +8,16 @@
 
 #define TOL 1e-5f
 
-void checkCudaError(cudaError_t err, const char *msg) {
+void checkCudaError(cudaError_t err, const char *msg)
+{
   if (err != cudaSuccess) {
     std::cerr << msg << " CUDA ERROR: " << cudaGetErrorString(err) << std::endl;
     exit(EXIT_FAILURE);
   }
 }
 
-void checkCublasError(cublasStatus_t status, const char *msg) {
+void checkCublasError(cublasStatus_t status, const char *msg) 
+{
   if (status != CUBLAS_STATUS_SUCCESS) {
     std::cerr << msg << " CUBLAS ERROR: " << status << std::endl;
     exit(EXIT_FAILURE);
