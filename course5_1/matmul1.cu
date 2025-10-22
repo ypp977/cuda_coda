@@ -61,7 +61,8 @@ __global__ void mysgemm_v2(int M, int N, int K, float alpha, float *A, float *B,
   C[ty * N + tx] = alpha * tmp + beta * C[ty * N + tx];
 }
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
-int main() {
+int main() 
+{
   std::vector<int> sizes = {1024};
 
   // 打开CSV文件
