@@ -29,70 +29,60 @@ void checkCublasError(cublasStatus_t status, const char* msg)
 // 模板参数：BLOCK_SIZE 表示线程块的边长（即 tile 的大小）
 // 例如 BLOCK_SIZE = 32，则每个线程块处理 32×32 的子矩阵
 template <const int BLOCK_SIZE>
-__global__ void mysgemm_v2(int M, int N, int K, float alpha, float* A, float* B, float beta,
-                           float* C)
+__global__ void sgemm_block(int M, int N, int K, float alpha, const float* A, const float* B,
+                            float beta, float* C)
 {
-    // 当前线程块在网格中的二维索引
-    int bx = blockIdx.x; // 对应输出矩阵 C 的列方向块索引
-    int by = blockIdx.y; // 对应输出矩阵 C 的行方向块索引
+    // 当前块在输出矩阵 C 中的二维索引
+    int block_col = blockIdx.x; // 当前块负责的列块编号
+    int block_row = blockIdx.y; // 当前块负责的行块编号
 
-    // tile 尺寸定义（方便阅读）
-    const int BM = BLOCK_SIZE; // tile 高度（对应 A、C 的行数）
-    const int BN = BLOCK_SIZE; // tile 宽度（对应 B、C 的列数）
-    const int BK = BLOCK_SIZE; // tile 深度（对应 A 的列数、B 的行数）
+    // 每个 block 对应的计算范围（行 × 列）
+    const int BLOCK_M = BLOCK_SIZE; // 每个 block 负责的行数
+    const int BLOCK_N = BLOCK_SIZE; // 每个 block 负责的列数
+    const int BLOCK_K = BLOCK_SIZE; // 每次加载的 K 方向 tile 大小
 
-    // 每个线程在 block 内的一维索引转为二维坐标
-    // 假设一个 block 含有 BLOCK_SIZE * BLOCK_SIZE 个线程
-    int tx = threadIdx.x % BN; // 当前线程在 tile 内的列索引
-    int ty = threadIdx.x / BN; // 当前线程在 tile 内的行索引
+    // 当前线程在 block 内的二维坐标
+    int thread_col = threadIdx.x % BLOCK_N; // 当前线程在 block 内的列号
+    int thread_row = threadIdx.x / BLOCK_N; // 当前线程在 block 内的行号
 
-    // 为 A 和 B 分配共享内存，用于存放当前 tile 的子块
-    // 共享内存能显著减少全局内存访问，提高带宽利用率
-    __shared__ float As[BM * BK];
-    __shared__ float Bs[BK * BN];
+    // 共享内存缓存子矩阵
+    __shared__ float blockA[BLOCK_M * BLOCK_K];
+    __shared__ float blockB[BLOCK_K * BLOCK_N];
 
-    // 将全局指针 A、B、C 偏移到当前 tile 的起始位置
-    // 注意：
-    //   A 的维度为 M×K
-    //   B 的维度为 K×N
-    //   C 的维度为 M×N
-    A = &A[by * BM * K];           // 当前 block 对应的 A 子矩阵起始位置
-    B = &B[bx * BN];               // 当前 block 对应的 B 子矩阵起始位置
-    C = &C[by * BM * N + bx * BN]; // 当前 block 对应的 C 子矩阵起始位置
+    // 计算全局内存中当前 block 对应的 A、B、C 起始位置
+    const float* A_block = &A[block_row * BLOCK_M * K];                 // A 起始位置
+    const float* B_block = &B[block_col * BLOCK_N];                     // B 起始位置
+    float* C_block = &C[block_row * BLOCK_M * N + block_col * BLOCK_N]; // C 起始位置
 
-    // 每个线程用于计算 C 子矩阵中一个元素的临时累积结果
-    float tmp = 0.0f;
+    // 当前线程负责的结果元素
+    float result = 0.0f;
 
-    // 分块循环（tile-by-tile 遍历 K 维）
-    // 每次加载 A、B 各一个子块到共享内存
-    for (int k = 0; k < K; k += BK)
+    // 沿着 K 维度分块计算
+    for (int k_offset = 0; k_offset < K; k_offset += BLOCK_K)
     {
-        // 每个线程负责将 A 子矩阵和 B 子矩阵的一部分加载到共享内存中
-        // A 的维度：BM×BK，B 的维度：BK×BN
-        As[ty * BK + tx] = A[ty * K + tx];
-        Bs[ty * BN + tx] = B[ty * N + tx];
+        // 每个线程从 A、B 读入一部分数据到共享内存
+        blockA[thread_row * BLOCK_K + thread_col] = A_block[thread_row * K + thread_col];
+        blockB[thread_row * BLOCK_N + thread_col] = B_block[thread_row * N + thread_col];
 
-        // 同步所有线程，确保共享内存中的数据已加载完毕
-        __syncthreads();
+        __syncthreads(); // 等待所有线程加载完成
 
-        // 更新 A、B 指针到下一个 tile
-        A += BK;     // A 向右平移 BK 列
-        B += BK * N; // B 向下平移 BK 行
-
-        // 当前 tile 内进行计算：矩阵乘法的核心逻辑
-        // tmp 累加每一行·列的乘积结果
-        for (int i = 0; i < BK; i++)
+        // 执行块内矩阵乘法
+        for (int k_inner = 0; k_inner < BLOCK_K; k_inner++)
         {
-            tmp += As[ty * BK + i] * Bs[i * BN + tx];
+            result +=
+                blockA[thread_row * BLOCK_K + k_inner] * blockB[k_inner * BLOCK_N + thread_col];
         }
 
-        // 再次同步，确保共享内存不会被下一个 tile 的数据覆盖
-        __syncthreads();
+        __syncthreads(); // 防止共享内存被下一轮覆盖
+
+        // 指针移动到下一个 K 分块
+        A_block += BLOCK_K;
+        B_block += BLOCK_K * N;
     }
 
-    // 计算完成后，将结果写回全局内存
-    // C = alpha * (A × B) + beta * C
-    C[ty * N + tx] = alpha * tmp + beta * C[ty * N + tx];
+    // 写回结果
+    C_block[thread_row * N + thread_col] =
+        alpha * result + beta * C_block[thread_row * N + thread_col];
 }
 
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
