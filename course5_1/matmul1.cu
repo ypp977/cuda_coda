@@ -74,6 +74,7 @@ __global__ void mysgemm_v1(int M, int N, int K, float alpha, float* A, float* B,
 
     for (int k_block = 0; k_block < K; k_block += BLOCK_K)
     {
+        shared_A[threadIdx.y * BLOCK_K + threadIdx.x] = A_start[threadIdx.y * K + threadIdx.x];
     }
 }
 
