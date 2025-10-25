@@ -25,53 +25,56 @@ void checkCublasError(cublasStatus_t status, const char* msg)
         exit(EXIT_FAILURE);
     }
 }
-
 /*
--------------------------------
+------------------------------------------
 mysgemm_v1: 手写矩阵乘法 Kernel
 计算公式: C = alpha * A * B + beta * C
--------------------------------
+------------------------------------------
 参数说明：
-  M: 矩阵A的行数
-  N: 矩阵B的列数
-  K: 矩阵A的列数，矩阵B的行数
+  M: 矩阵 A 的行数
+  N: 矩阵 B 的列数（同时是矩阵 C 的列数）
+  K: 矩阵 A 的列数 = 矩阵 B 的行数
   alpha: 矩阵乘法系数
-  A: 矩阵A
-  B: 矩阵B
-  beta: 矩阵乘法系数
-  C: 矩阵C
-
-  Block Size: 32
+  beta:  累加系数（控制是否叠加原有 C）
+  A, B, C: 分别是输入矩阵和输出矩阵（行主序 Row-major）
+  BLOCK_SIZE: 每个线程块计算的 tile 尺寸（方块区域大小）
 */
 template <const int BLOCK_SIZE>
 __global__ void mysgemm_v1(int M, int N, int K, float alpha, float* A, float* B, float beta,
                            float* C)
 {
-    // 当前线程在C中的坐标
-    // 当前 block 处理 C 的第几列块
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    // 当前 block 处理 C 的第几行块
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    // ======== Block 级别坐标 ========
+    // 当前 block 在输出矩阵 C 中的 tile 索引
+    int block_row = blockIdx.y; // 沿着行方向的 tile 编号
+    int block_col = blockIdx.x; // 沿着列方向的 tile 编号
 
-    // 每个 block 负责计算的 tile 大小(行、列、K方向)
-    // 每个 block 负责的行数
-    const int BLOCK_M = BLOCK_SIZE;
-    // 每个 block 负责的列数
-    const int BLOCK_N = BLOCK_SIZE;
-    // 每个 block 负责的 K 方向的元素数量
-    const int BLOCK_K = BLOCK_SIZE;
+    // ======== Tile 尺寸定义 ========
+    // 每个 block 负责计算一个 BLOCK_M × BLOCK_N 的输出子块
+    const int BLOCK_M = BLOCK_SIZE; // tile 的行数
+    const int BLOCK_N = BLOCK_SIZE; // tile 的列数
+    const int BLOCK_K = BLOCK_SIZE; // tile 内 K 方向分块宽度
 
-    // 当前线程在 block 内的坐标(行、列)
-    // 当前线程负责的列索引
-    int thread_col = threadIdx.x % BLOCK_N;
-    // 当前线程负责的行索引
-    int thread_row = threadIdx.x / BLOCK_N;
+    // ======== Thread 级别坐标 ========
+    // 每个线程在 block 内二维坐标（行、列）
+    int thread_row = threadIdx.y; // 线程在 tile 内的行索引
+    int thread_col = threadIdx.x; // 线程在 tile 内的列索引
 
-    // 分配共享内存
+    // ======== 共享内存分配 ========
+    // 用于存储从全局内存中加载的 A、B 子块
     __shared__ float shared_A[BLOCK_M * BLOCK_K];
-    __shared__ float shared_B[BLOCK_N * BLOCK_K];
+    __shared__ float shared_B[BLOCK_K * BLOCK_N];
 
-    // 计算当前 block 对应的全局矩阵起始地址
+    // ======== 全局内存起始地址 ========
+    // 当前 block 对应的 A、B、C 子块起始地址
+    const float* A_start = &A[block_row * BLOCK_M * K]; // A 从第 block_row*BLOCK_M 行开始
+    const float* B_start = &B[block_col * BLOCK_N];     // B 从第 block_col*BLOCK_N 列开始
+    float* C_start = &C[block_row * BLOCK_M * N + block_col * BLOCK_N]; // C 对应 tile 的起始位置
+
+    float result = 0.0f;
+
+    for (int k_block = 0; k_block < K; k_block += BLOCK_K)
+    {
+    }
 }
 
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
