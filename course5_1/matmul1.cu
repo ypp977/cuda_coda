@@ -26,63 +26,52 @@ void checkCublasError(cublasStatus_t status, const char* msg)
     }
 }
 
-// 模板参数：BLOCK_SIZE 表示线程块的边长（即 tile 的大小）
-// 例如 BLOCK_SIZE = 32，则每个线程块处理 32×32 的子矩阵
+/*
+-------------------------------
+mysgemm_v1: 手写矩阵乘法 Kernel
+计算公式: C = alpha * A * B + beta * C
+-------------------------------
+参数说明：
+  M: 矩阵A的行数
+  N: 矩阵B的列数
+  K: 矩阵A的列数，矩阵B的行数
+  alpha: 矩阵乘法系数
+  A: 矩阵A
+  B: 矩阵B
+  beta: 矩阵乘法系数
+  C: 矩阵C
+
+  Block Size: 32
+*/
 template <const int BLOCK_SIZE>
-__global__ void sgemm_block(int M, int N, int K, float alpha, const float* A, const float* B,
-                            float beta, float* C)
+__global__ void mysgemm_v1(int M, int N, int K, float alpha, float* A, float* B, float beta,
+                           float* C)
 {
-    // 当前块在输出矩阵 C 中的二维索引
-    int block_col = blockIdx.x; // 当前块负责的列块编号
-    int block_row = blockIdx.y; // 当前块负责的行块编号
+    // 当前线程在C中的坐标
+    // 当前 block 处理 C 的第几列块
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    // 当前 block 处理 C 的第几行块
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // 每个 block 对应的计算范围（行 × 列）
-    const int BLOCK_M = BLOCK_SIZE; // 每个 block 负责的行数
-    const int BLOCK_N = BLOCK_SIZE; // 每个 block 负责的列数
-    const int BLOCK_K = BLOCK_SIZE; // 每次加载的 K 方向 tile 大小
+    // 每个 block 负责计算的 tile 大小(行、列、K方向)
+    // 每个 block 负责的行数
+    const int BLOCK_M = BLOCK_SIZE;
+    // 每个 block 负责的列数
+    const int BLOCK_N = BLOCK_SIZE;
+    // 每个 block 负责的 K 方向的元素数量
+    const int BLOCK_K = BLOCK_SIZE;
 
-    // 当前线程在 block 内的二维坐标
-    int thread_col = threadIdx.x % BLOCK_N; // 当前线程在 block 内的列号
-    int thread_row = threadIdx.x / BLOCK_N; // 当前线程在 block 内的行号
+    // 当前线程在 block 内的坐标(行、列)
+    // 当前线程负责的列索引
+    int thread_col = threadIdx.x % BLOCK_N;
+    // 当前线程负责的行索引
+    int thread_row = threadIdx.x / BLOCK_N;
 
-    // 共享内存缓存子矩阵
-    __shared__ float blockA[BLOCK_M * BLOCK_K];
-    __shared__ float blockB[BLOCK_K * BLOCK_N];
+    // 分配共享内存
+    __shared__ float shared_A[BLOCK_M * BLOCK_K];
+    __shared__ float shared_B[BLOCK_N * BLOCK_K];
 
-    // 计算全局内存中当前 block 对应的 A、B、C 起始位置
-    const float* A_block = &A[block_row * BLOCK_M * K];                 // A 起始位置
-    const float* B_block = &B[block_col * BLOCK_N];                     // B 起始位置
-    float* C_block = &C[block_row * BLOCK_M * N + block_col * BLOCK_N]; // C 起始位置
-
-    // 当前线程负责的结果元素
-    float result = 0.0f;
-
-    // 沿着 K 维度分块计算
-    for (int k_offset = 0; k_offset < K; k_offset += BLOCK_K)
-    {
-        // 每个线程从 A、B 读入一部分数据到共享内存
-        blockA[thread_row * BLOCK_K + thread_col] = A_block[thread_row * K + thread_col];
-        blockB[thread_row * BLOCK_N + thread_col] = B_block[thread_row * N + thread_col];
-
-        __syncthreads(); // 等待所有线程加载完成
-
-        // 执行块内矩阵乘法
-        for (int k_inner = 0; k_inner < BLOCK_K; k_inner++)
-        {
-            result +=
-                blockA[thread_row * BLOCK_K + k_inner] * blockB[k_inner * BLOCK_N + thread_col];
-        }
-
-        __syncthreads(); // 防止共享内存被下一轮覆盖
-
-        // 指针移动到下一个 K 分块
-        A_block += BLOCK_K;
-        B_block += BLOCK_K * N;
-    }
-
-    // 写回结果
-    C_block[thread_row * N + thread_col] =
-        alpha * result + beta * C_block[thread_row * N + thread_col];
+    // 计算当前 block 对应的全局矩阵起始地址
 }
 
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
@@ -175,7 +164,7 @@ int main()
 
             for (int i = 0; i < warpup_time; ++i)
             {
-                mysgemm_v2<32><<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
+                mysgemm_v1<32><<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
             }
 
             cudaDeviceSynchronize();
@@ -185,7 +174,7 @@ int main()
 
             for (int i = 0; i < repeat_time; ++i)
             {
-                mysgemm_v2<32><<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
+                mysgemm_v1<32><<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
             }
             checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop v1) failed");
             checkCudaError(cudaEventSynchronize(stop), "cudaEventSynchronize v1 failed");
