@@ -31,51 +31,114 @@ mysgemm_v1: 手写矩阵乘法 Kernel
 计算公式: C = alpha * A * B + beta * C
 ------------------------------------------
 参数说明：
-  M: 矩阵 A 的行数
-  N: 矩阵 B 的列数（同时是矩阵 C 的列数）
-  K: 矩阵 A 的列数 = 矩阵 B 的行数
-  alpha: 矩阵乘法系数
-  beta:  累加系数（控制是否叠加原有 C）
-  A, B, C: 分别是输入矩阵和输出矩阵（行主序 Row-major）
-  BLOCK_SIZE: 每个线程块计算的 tile 尺寸（方块区域大小）
+    M: 矩阵 A 的行数
+    N: 矩阵 B 的列数（同时也是矩阵 C 的列数）
+    K: 矩阵 A 的列数 = 矩阵 B 的行数
+    alpha: 矩阵乘法系数
+    beta:  累加系数（控制是否叠加原有 C）
+    A, B, C: 输入输出矩阵（行主序 Row-major）
+
+矩阵维度：
+    A: M × K
+    B: K × N
+    C: M × N
+
+算法思路：
+    1. 将矩阵按 tile（子块）分块。
+    2. 每个 block 负责计算一个 BLOCK_SIZE × BLOCK_SIZE 的 C 子矩阵。
+    3. 每次从全局内存加载 A、B 对应的 tile 到共享内存 shared_A / shared_B。
+    4. 在共享内存中完成部分乘加运算。
+    5. 沿着 K 方向逐块累积，最终得到 C_tile。
 */
+
 template <const int BLOCK_SIZE>
 __global__ void mysgemm_v1(int M, int N, int K, float alpha, float* A, float* B, float beta,
                            float* C)
 {
     // ======== Block 级别坐标 ========
-    // 当前 block 在输出矩阵 C 中的 tile 索引
-    int block_row = blockIdx.y; // 沿着行方向的 tile 编号
-    int block_col = blockIdx.x; // 沿着列方向的 tile 编号
+    int block_row = blockIdx.y; // 当前 block 对应 C 的行方向 tile 索引
+    int block_col = blockIdx.x; // 当前 block 对应 C 的列方向 tile 索引
 
     // ======== Tile 尺寸定义 ========
-    // 每个 block 负责计算一个 BLOCK_M × BLOCK_N 的输出子块
-    const int BLOCK_M = BLOCK_SIZE; // tile 的行数
-    const int BLOCK_N = BLOCK_SIZE; // tile 的列数
-    const int BLOCK_K = BLOCK_SIZE; // tile 内 K 方向分块宽度
+    // 一个 block 负责计算一个 BLOCK_SIZE × BLOCK_SIZE 的 C 子块
+    const int BLOCK_M = BLOCK_SIZE;
+    const int BLOCK_N = BLOCK_SIZE;
+    const int BLOCK_K = BLOCK_SIZE; // 每次沿 K 方向加载的宽度（tile 的厚度）
 
     // ======== Thread 级别坐标 ========
-    // 每个线程在 block 内二维坐标（行、列）
-    int thread_row = threadIdx.y; // 线程在 tile 内的行索引
-    int thread_col = threadIdx.x; // 线程在 tile 内的列索引
+    int thread_row = threadIdx.y; // 当前线程在 tile 内的行索引
+    int thread_col = threadIdx.x; // 当前线程在 tile 内的列索引
 
     // ======== 共享内存分配 ========
-    // 用于存储从全局内存中加载的 A、B 子块
+    // 存储从全局内存加载的 A、B 子块，大小为 BLOCK_M×BLOCK_K 和 BLOCK_K×BLOCK_N
     __shared__ float shared_A[BLOCK_M * BLOCK_K];
     __shared__ float shared_B[BLOCK_K * BLOCK_N];
 
     // ======== 全局内存起始地址 ========
-    // 当前 block 对应的 A、B、C 子块起始地址
-    const float* A_start = &A[block_row * BLOCK_M * K]; // A 从第 block_row*BLOCK_M 行开始
-    const float* B_start = &B[block_col * BLOCK_N];     // B 从第 block_col*BLOCK_N 列开始
-    float* C_start = &C[block_row * BLOCK_M * N + block_col * BLOCK_N]; // C 对应 tile 的起始位置
+    // 计算当前 block 对应的 A、B、C 子块在全局内存中的起点
 
+    // 对 A：
+    // block_row 表示第几个 A 子块行，每个子块行高为 BLOCK_M
+    // 因此偏移量为 block_row * BLOCK_M * K
+    const float* A_start = &A[block_row * BLOCK_M * K];
+
+    // 对 B：
+    // block_col 表示第几个 B 子块列，每列宽为 BLOCK_N
+    // 因此偏移量为 block_col * BLOCK_N
+    const float* B_start = &B[block_col * BLOCK_N];
+
+    // 对 C：
+    // 每个子块在 C 中的偏移量由行偏移和列偏移共同决定
+    float* C_start = &C[block_row * BLOCK_M * N + block_col * BLOCK_N];
+
+    // ======== 累积结果寄存器 ========
+    // 每个线程对应 C_tile 的一个元素
     float result = 0.0f;
 
+    // ======== 沿 K 方向分块循环 ========
+    // 每次循环处理 A 的 BLOCK_K 列、B 的 BLOCK_K 行
     for (int k_block = 0; k_block < K; k_block += BLOCK_K)
     {
-        shared_A[threadIdx.y * BLOCK_K + threadIdx.x] = A_start[threadIdx.y * K + threadIdx.x];
+        // -------------------------------
+        // 1. 从全局内存加载 A、B 当前 tile 到共享内存
+        // -------------------------------
+        // A_tile 对应 A 中第 block_row 个 tile 行，第 k_block 个 tile 列
+        // 每个线程负责加载一个元素
+        shared_A[thread_row * BLOCK_K + thread_col] = A_start[thread_row * K + thread_col];
+
+        // B_tile 对应 B 中第 k_block 个 tile 行，第 block_col 个 tile 列
+        shared_B[thread_row * BLOCK_N + thread_col] = B_start[thread_row * N + thread_col];
+
+        // 等待所有线程完成加载
+        __syncthreads();
+
+        // -------------------------------
+        // 2. 在共享内存中完成矩阵乘法部分计算
+        // -------------------------------
+        for (int k_inner = 0; k_inner < BLOCK_K; k_inner++)
+        {
+            result +=
+                shared_A[thread_row * BLOCK_K + k_inner] * shared_B[k_inner * BLOCK_N + thread_col];
+        }
+
+        // 等待所有线程完成计算，准备加载下一块
+        __syncthreads();
+
+        // -------------------------------
+        // 3. 移动到下一 tile 段
+        // -------------------------------
+        // 对 A：向右移动 BLOCK_K 列
+        A_start += BLOCK_K;
+
+        // 对 B：向下移动 BLOCK_K 行，每行有 N 个元素
+        // 因为 B 是 K×N 按行主序存储，所以跳过 BLOCK_K*N 个元素
+        B_start += BLOCK_K * N;
     }
+
+    // ======== 结果写回全局内存 ========
+    // 每个线程写一个元素
+    C_start[thread_row * N + thread_col] =
+        alpha * result + beta * C_start[thread_row * N + thread_col];
 }
 
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
