@@ -68,7 +68,7 @@ int main()
     std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096, 8192};
 
     // 打开CSV文件，写入表头
-    std::ofstream csv_file("sgemm_benchmark_v1.csv");
+    std::ofstream csv_file("sgemm_benchmark_V0.csv");
     csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched" << std::endl;
 
     // 遍历每个矩阵尺寸
@@ -81,13 +81,13 @@ int main()
         float* host_A = (float*)malloc(size);
         float* host_B = (float*)malloc(size);
         float* host_C_cublas = (float*)malloc(size);
-        float* host_C_v1 = (float*)malloc(size);
+        float* host_C_V0 = (float*)malloc(size);
 
         // 分配GPU内存
-        float *device_A, *device_B, *device_C_V1;
+        float *device_A, *device_B, *device_C_V0;
         checkCudaError(cudaMalloc(&device_A, size), "cudaMalloc device_A failed");
         checkCudaError(cudaMalloc(&device_B, size), "cudaMalloc device_B failed");
-        checkCudaError(cudaMalloc(&device_C_V1, size), "cudaMalloc device_C_V1 failed");
+        checkCudaError(cudaMalloc(&device_C_V0, size), "cudaMalloc device_C_V0 failed");
 
         bool out_of_memory = false;
 
@@ -129,7 +129,7 @@ int main()
                                              N, N, N,                          // 矩阵维度
                                              &alpha, device_B, N,              // B矩阵与其步长
                                              device_A, N,                      // A矩阵与其步长
-                                             &beta, device_C_V1, N),           // 输出矩阵C与步长
+                                             &beta, device_C_V0, N),           // 输出矩阵C与步长
                                  "cublasSgemm failed");
             }
             cudaDeviceSynchronize(); // 等待预热结束
@@ -142,7 +142,7 @@ int main()
             for (int i = 0; i < repeat_time; i++)
             {
                 checkCublasError(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha,
-                                             device_B, N, device_A, N, &beta, device_C_V1, N),
+                                             device_B, N, device_A, N, &beta, device_C_V0, N),
                                  "cublasSgemm failed");
             }
             checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop cublas) failed");
@@ -153,13 +153,13 @@ int main()
                            "cudaEventElapsedTime cublas failed");
 
             // 将 cuBLAS 结果拷回主机
-            checkCudaError(cudaMemcpy(host_C_cublas, device_C_V1, size, cudaMemcpyDeviceToHost),
+            checkCudaError(cudaMemcpy(host_C_cublas, device_C_V0, size, cudaMemcpyDeviceToHost),
                            "cudaMemcpy host_C_cublas failed");
 
             // -----------------------------
             // (3) 手写 SGEMM 核函数测试
             // -----------------------------
-            checkCudaError(cudaMemset(device_C_V1, 0, size), "cudaMemset device_C_V1 failed");
+            checkCudaError(cudaMemset(device_C_V0, 0, size), "cudaMemset device_C_V0 failed");
 
             // 配置线程块
             dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
@@ -169,27 +169,27 @@ int main()
             for (int i = 0; i < warpup_time; i++)
             {
                 mysgemm_v0<<<blocks, threads>>>(N, N, N, alpha, device_A, device_B, beta,
-                                                device_C_V1);
+                                                device_C_V0);
             }
             cudaDeviceSynchronize();
 
             // 正式计时
-            checkCudaError(cudaEventRecord(start), "cudaEventRecord(start mysgemm_v1) failed");
+            checkCudaError(cudaEventRecord(start), "cudaEventRecord(start mysgemm_V0) failed");
             for (int i = 0; i < repeat_time; i++)
             {
                 mysgemm_v0<<<blocks, threads>>>(N, N, N, alpha, device_A, device_B, beta,
-                                                device_C_V1);
+                                                device_C_V0);
             }
-            checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop mysgemm_v1) failed");
-            checkCudaError(cudaEventSynchronize(stop), "cudaEventSynchronize mysgemm_v1 failed");
+            checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop mysgemm_V0) failed");
+            checkCudaError(cudaEventSynchronize(stop), "cudaEventSynchronize mysgemm_V0 failed");
 
-            float v1_time = 0;
-            checkCudaError(cudaEventElapsedTime(&v1_time, start, stop),
-                           "cudaEventElapsedTime mysgemm_v1 failed");
+            float V0_time = 0;
+            checkCudaError(cudaEventElapsedTime(&V0_time, start, stop),
+                           "cudaEventElapsedTime mysgemm_V0 failed");
 
             // 将结果拷回主机
-            checkCudaError(cudaMemcpy(host_C_v1, device_C_V1, size, cudaMemcpyDeviceToHost),
-                           "cudaMemcpy host_C_v1 failed");
+            checkCudaError(cudaMemcpy(host_C_V0, device_C_V0, size, cudaMemcpyDeviceToHost),
+                           "cudaMemcpy host_C_V0 failed");
 
             // -----------------------------
             // (4) 验证结果正确性
@@ -197,7 +197,7 @@ int main()
             int error_count = 0;
             for (int i = 0; i < N * N && error_count < 10; i++)
             {
-                if (fabsf(host_C_cublas[i] - host_C_v1[i]) > TOL)
+                if (fabsf(host_C_cublas[i] - host_C_V0[i]) > TOL)
                 {
                     error_count++;
                 }
@@ -207,13 +207,13 @@ int main()
             // (5) 计算性能指标（GFlops）
             // -----------------------------
             // 理论计算量为 2 * N^3（乘加运算各一次）
-            // cublas_time/v1_time 单位是毫秒，因此乘 1e6 转为秒
+            // cublas_time/V0_time 单位是毫秒，因此乘 1e6 转为秒
             double total_flops = double(repeat_time) * 2.0 * double(N) * double(N) * double(N);
             double cublas_gflops = total_flops / (double(cublas_time) * 1e6);
-            double v1_gflops = total_flops / (double(v1_time) * 1e6);
+            double V0_gflops = total_flops / (double(V0_time) * 1e6);
 
             // 写入CSV结果
-            csv_file << N << "," << cublas_gflops << "," << v1_gflops << ","
+            csv_file << N << "," << cublas_gflops << "," << V0_gflops << ","
                      << (error_count == 0 ? "1" : "0") << std::endl;
 
             // -----------------------------
@@ -225,12 +225,12 @@ int main()
 
             cudaFree(device_A);
             cudaFree(device_B);
-            cudaFree(device_C_V1);
+            cudaFree(device_C_V0);
 
             free(host_A);
             free(host_B);
             free(host_C_cublas);
-            free(host_C_v1);
+            free(host_C_V0);
         }
         catch (...)
         {
