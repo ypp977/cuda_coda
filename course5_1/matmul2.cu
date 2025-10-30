@@ -26,70 +26,35 @@ void checkCublasError(cublasStatus_t status, const char* msg)
     }
 }
 
-template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void mysgemm_v4(int M, int N, int K, float alpha, float* A, float* B, float beta,
-                           float* C)
+template <const int TILE_M, const int TILE_N, const int TILE_K, const int THREAD_M,
+          const int THREAD_N>
+__global__ void mysgemm_v2(int M, int N, int K, float alpha, const float* A, const float* B,
+                           float beta, float* C)
 {
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
+    int block_col = blockIdx.x;
+    int block_row = blockIdx.y;
 
-    int block_row_thread = BN / TN;
-    int block_col_thread = BM / TM;
-    int thread_num = block_row_thread * block_col_thread;
+    int threads_per_tile_x = TILE_N / THREAD_N;
+    int threads_per_tile_y = TILE_M / THREAD_M;
+    int total_threads = threads_per_tile_x * threads_per_tile_y;
 
-    int tx = (threadIdx.x % block_row_thread) * TN;
-    int ty = (threadIdx.x / block_row_thread) * TM;
+    int local_col = (threadIdx.x % threads_per_tile_x) * THREAD_N;
+    int local_row = (threadIdx.y % threads_per_tile_y) * THREAD_M;
 
-    __shared__ float As[BM * BK];
-    __shared__ float Bs[BK * BN];
+    __shared__ float shared_a[TILE_M * TILE_K];
+    __shared__ float shared_b[TILE_K * TILE_N];
 
-    A = &A[by * BM * K];
-    B = &B[bx * BN];
-    C = &C[by * BM * N + bx * BN];
+    const float* A_block_ptr = A + block_row * TILE_M * K;
+    const float* B_block_prt = B + block_col * TILE_N;
+    float* C_block_ptr = C + block_row * TILE_M + block_col * TILE_N;
 
-    int a_tile_row = threadIdx.x / BK;
-    int a_tile_col = threadIdx.x % BK;
-    int a_tile_stride = thread_num / BK;
+    int a_load_row = threadIdx.x / TILE_K;
+    int a_load_col = threadIdx.x % TILE_K;
+    int a_load_stride = total_threads / TILE_K;
 
-    int b_tile_row = threadIdx.x / BN;
-    int b_tile_col = threadIdx.x % BN;
-    int b_tile_stride = thread_num / BN;
-
-    float tmp[TM][TN] = {0.};
-#pragma unroll
-    for (int k = 0; k < K; k += BK)
-    {
-#pragma unroll
-        for (int i = 0; i < BM; i += a_tile_stride)
-        {
-            As[(a_tile_row + i) * BK + a_tile_col] = A[(a_tile_row + i) * K + a_tile_col];
-        }
-#pragma unroll
-        for (int i = 0; i < BK; i += b_tile_stride)
-        {
-            Bs[(b_tile_row + i) * BN + b_tile_col] = B[(b_tile_row + i) * N + b_tile_col];
-        }
-        __syncthreads();
-        A += BK;
-        B += BK * N;
-#pragma unroll
-        for (int i = 0; i < BK; i++)
-        {
-#pragma unroll
-            for (int j = 0; j < TM; j++)
-            {
-                for (int l = 0; l < TN; l++)
-                    tmp[j][l] += As[(ty + j) * BK + i] * Bs[tx + l + i * BN];
-            }
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int j = 0; j < TM; j++)
-    {
-        for (int l = 0; l < TN; l++)
-            C[(ty + j) * N + tx + l] = alpha * tmp[j][l] + beta * C[(ty + j) * N + tx + l];
-    }
+    int b_load_row = threadIdx.y / TILE_N;
+    int b_load_col = threadIdx.y % TILE_N;
+    int b_load_stride = total_threads / TILE_N;
 }
 
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
