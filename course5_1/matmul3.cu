@@ -83,8 +83,8 @@ __global__ void mysgemm_v3(int M, int N, int K, float alpha, const float* __rest
 
     // ------------------------------
     // 4. 分配共享内存用于缓存当前 tile 的 A/B 子块
-    // shared_a: BLOCK_K × BLOCK_M
-    // shared_b: BLOCK_K × BLOCK_N
+    // shared_a: BLOCK_K × BLOCK_M，用于缓存 A tile 并可转置访问
+    // shared_b: BLOCK_K × BLOCK_N，用于缓存 B tile
     // ------------------------------
     __shared__ float shared_a[BLOCK_K * BLOCK_M];
     __shared__ float shared_b[BLOCK_K * BLOCK_N];
@@ -126,6 +126,94 @@ __global__ void mysgemm_v3(int M, int N, int K, float alpha, const float* __rest
     A = &A[block_row_idx * BLOCK_M * K];                           // 当前 block A 子块起始行
     B = &B[block_col_idx * BLOCK_N];                               // 当前 block B 子块起始列
     C = &C[block_row_idx * BLOCK_M * N + block_col_idx * BLOCK_N]; // 输出子块起始位置
+
+    // ------------------------------
+    // 9. 沿 K 方向循环处理 BLOCK_K 大小的 tile
+    // ------------------------------
+#pragma unroll
+    for (int k_block_start = 0; k_block_start < K; k_block_start += BLOCK_K)
+    {
+        // ---- 9.1 将 A tile 从全局内存加载到共享内存并转置 ----
+#pragma unroll
+        for (int i = 0; i < BLOCK_M; i += a_load_stride)
+        {
+            const int reg_idx = i / a_load_stride * 4;
+            FETCH_FLOAT4(reg_a_vec[reg_idx]) =
+                FETCH_FLOAT4(A[OFFSET(a_load_row + i, a_load_col, K)]);
+
+            // 将 A tile 转置存入共享内存，便于连续访存
+            shared_a[OFFSET(a_load_col, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx];
+            shared_a[OFFSET(a_load_col + 1, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx + 1];
+            shared_a[OFFSET(a_load_col + 2, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx + 2];
+            shared_a[OFFSET(a_load_col + 3, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx + 3];
+        }
+
+        // ---- 9.2 将 B tile 从全局内存加载到共享内存 ----
+#pragma unroll
+        for (int i = 0; i < BLOCK_K; i += b_load_stride)
+        {
+            FETCH_FLOAT4(shared_b[OFFSET(b_load_row + i, b_load_col, BLOCK_N)]) =
+                FETCH_FLOAT4(B[OFFSET(b_load_row + i, b_load_col, N)]);
+        }
+
+        __syncthreads(); // 保证所有线程完成共享内存加载
+
+        // ---- 9.3 移动全局指针到下一 K 块 ----
+        A += BLOCK_K;     // A 往右移动 BLOCK_K 列
+        B += BLOCK_K * N; // B 往下移动 BLOCK_K 行
+
+        // ---- 9.4 在共享内存中执行矩阵乘法 ----
+#pragma unroll
+        for (int k_inner = 0; k_inner < BLOCK_K; k_inner++)
+        {
+            // 加载 A tile 当前行到寄存器
+#pragma unroll
+            for (int m = 0; m < THREAD_M; m += 4)
+            {
+                FETCH_FLOAT4(reg_a_tile[m]) =
+                    FETCH_FLOAT4(shared_a[OFFSET(k_inner, local_row_idx + m, BLOCK_M)]);
+            }
+
+            // 加载 B tile 当前列到寄存器
+#pragma unroll
+            for (int n = 0; n < THREAD_N; n += 4)
+            {
+                FETCH_FLOAT4(reg_b_tile[n]) =
+                    FETCH_FLOAT4(shared_b[OFFSET(k_inner, local_col_idx + n, BLOCK_N)]);
+            }
+
+            // 在寄存器中累加 C 子块
+#pragma unroll
+            for (int m = 0; m < THREAD_M; m++)
+            {
+#pragma unroll
+                for (int n = 0; n < THREAD_N; n++)
+                {
+                    accum[m][n] += reg_a_tile[m] * reg_b_tile[n];
+                }
+            }
+        }
+        __syncthreads(); // 保证累加完成后再进行下一 K tile
+    }
+
+    // ------------------------------
+    // 10. 将累加结果写回全局内存
+    // ------------------------------
+#pragma unroll
+    for (int m = 0; m < THREAD_M; m++)
+    {
+#pragma unroll
+        for (int n = 0; n < THREAD_N; n += 4)
+        {
+            float4 c_val = FETCH_FLOAT4(C[OFFSET(local_row_idx + m, local_col_idx + n, N)]);
+            // 按 BLAS 规范计算 alpha * A*B + beta * C
+            c_val.x = alpha * accum[m][n] + beta * c_val.x;
+            c_val.y = alpha * accum[m][n + 1] + beta * c_val.y;
+            c_val.z = alpha * accum[m][n + 2] + beta * c_val.z;
+            c_val.w = alpha * accum[m][n + 3] + beta * c_val.w;
+            FETCH_FLOAT4(C[OFFSET(local_row_idx + m, local_col_idx + n, N)]) = c_val;
+        }
+    }
 }
 
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
