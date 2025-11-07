@@ -59,198 +59,162 @@ mysgemm_v4: 手写高性能SGEMM kernel (C = alpha * A * B + beta * C)
 6. 最后将寄存器结果按alpha/beta写回全局内存。
 ------------------------------------------------------------
 */
-template <const int BM, const int BN, const int BK, const int TM, const int TN>
+template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int THREAD_M,
+          const int THREAD_N>
 __global__ void __launch_bounds__(256)
     mysgemm_v4(int M, int N, int K, float alpha, float* __restrict__ A, float* __restrict__ B,
                float beta, float* __restrict__ C)
 {
-    // ------------------------------
-    // 1. 当前Block在C矩阵中的位置
-    // ------------------------------
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
+    const int block_col_idx = blockIdx.x;
+    const int block_row_idx = blockIdx.y;
 
-    // ------------------------------
-    // 2. Tile内线程划分
-    // ------------------------------
-    const int threads_per_row = BN / TN;
-    const int threads_per_col = BM / TM;
-    const int thread_num = threads_per_row * threads_per_col;
+    const int thread_per_row = BLOCK_N / THREAD_N;
+    const int thread_per_col = BLOCK_M / THREAD_M;
+    const int thread_per_block = thread_per_row * thread_per_col;
 
-    // ------------------------------
-    // 3. 当前线程负责的局部C子块左上角
-    // ------------------------------
-    int tx = (threadIdx.x % threads_per_row) * TN;
-    int ty = (threadIdx.x / threads_per_row) * TM;
+    const int local_col_idx = (threadIdx.x / thread_per_row) * THREAD_N;
+    const int local_row_idx = (threadIdx.x % thread_per_row) * THREAD_M;
 
-    // ------------------------------
-    // 4. 分配共享内存存储A/B tile
-    // double buffer设计: 0/1交替加载
-    // ------------------------------
-    __shared__ float As[2][BK * BM];
-    __shared__ float Bs[2][BK * BN];
+    __shared__ float shared_a[2][BLOCK_K * BLOCK_M];
+    __shared__ float shared_b[2][BLOCK_K * BLOCK_N];
 
-    // ------------------------------
-    // 5. 线程向量化加载数量
-    // ------------------------------
-    const int ldg_a_num = BK * BM / thread_num / 4;
-    const int ldg_b_num = BK * BN / thread_num / 4;
+    const int vec4_load_per_thread_a = BLOCK_K * BLOCK_M / thread_per_block / 4;
+    const int vec4_load_per_thread_b = BLOCK_K * BLOCK_N / thread_per_block / 4;
 
-    // ------------------------------
-    // 6. 线程加载tile起点/步长
-    // ------------------------------
-    int a_tile_row = threadIdx.x / (BK / 4);
-    int a_tile_col = (threadIdx.x % (BK / 4)) * 4;
-    int a_tile_stride = BM / ldg_a_num;
+    const int a_load_row = threadIdx.x / (BLOCK_K / 4);
+    const int a_load_col = (threadIdx.x % (BLOCK_K / 4)) * 4;
+    const int a_load_stride = BLOCK_M / vec4_load_per_thread_a;
 
-    int b_tile_row = threadIdx.x / (BN / 4);
-    int b_tile_col = (threadIdx.x % (BN / 4)) * 4;
-    int b_tile_stride = BK / ldg_b_num;
+    const int b_load_row = threadIdx.x / (BLOCK_K / 4);
+    const int b_load_col = (threadIdx.x % (BLOCK_K / 4)) * 4;
+    const int b_load_stride = BLOCK_N / vec4_load_per_thread_b;
 
-    // ------------------------------
-    // 7. 寄存器缓存
-    // accum: 线程累加结果
-    // ldg_a_reg / ldg_b_reg: 线程加载A/B向量缓存
-    // a_frag / b_frag: 当前迭代共享内存tile缓存
-    // ------------------------------
-    float accum[TM][TN] = {0.};
-    float ldg_a_reg[4 * ldg_a_num] = {0.};
-    float ldg_b_reg[4 * ldg_b_num] = {0.};
-    float a_frag[2][TM];
-    float b_frag[2][TN];
+    float accum[THREAD_M][THREAD_N] = {0.};
 
-    // ------------------------------
-    // 8. 指针偏移到当前Block对应子矩阵
-    // ------------------------------
-    A = &A[by * BM * K];
-    B = &B[bx * BN];
-    C = &C[by * BM * N + bx * BN];
+    float reg_a_vec[4 * vec4_load_per_thread_a] = {0.};
+    float reg_b_vec[4 * vec4_load_per_thread_b] = {0.};
+    float reg_b_tile[2][THREAD_M];
+    float reg_a_tile[2][THREAD_N];
 
-    // ------------------------------
-    // 9. 预加载第一个tile到共享内存
-    // ------------------------------
+    A = &A[block_row_idx * BLOCK_M * K];
+    B = &B[block_col_idx * BLOCK_N];
+    C = &C[block_row_idx * BLOCK_M * N + block_col_idx * BLOCK_N];
+
 #pragma unroll
-    for (int i = 0; i < BM; i += a_tile_stride)
+    for (int i = 0; i < BLOCK_M; i += a_load_stride)
     {
-        int ldg_index = i / a_tile_stride * 4;
-        FETCH_FLOAT4(ldg_a_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(a_tile_row + i, a_tile_col, K)]);
-        // 存入共享内存
-        As[0][OFFSET(a_tile_col, i + a_tile_row, BM)] = ldg_a_reg[ldg_index];
-        As[0][OFFSET(a_tile_col + 1, i + a_tile_row, BM)] = ldg_a_reg[ldg_index + 1];
-        As[0][OFFSET(a_tile_col + 2, i + a_tile_row, BM)] = ldg_a_reg[ldg_index + 2];
-        As[0][OFFSET(a_tile_col + 3, i + a_tile_row, BM)] = ldg_a_reg[ldg_index + 3];
+        int reg_idx = i / a_load_stride * 4;
+        FETCH_FLOAT4(reg_a_vec[reg_idx]) = FETCH_FLOAT4(A[OFFSET(a_load_row + i, a_load_col, K)]);
+
+        shared_a[0][OFFSET(a_load_col, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx];
+        shared_a[0][OFFSET(a_load_col + 1, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx + 1];
+        shared_a[0][OFFSET(a_load_col + 2, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx + 2];
+        shared_a[0][OFFSET(a_load_col + 3, i + a_load_row, BLOCK_M)] = reg_a_vec[reg_idx + 3];
     }
+
 #pragma unroll
-    for (int i = 0; i < BK; i += b_tile_stride)
+    for (int i = 0; i < BLOCK_K; i += b_load_stride)
     {
-        FETCH_FLOAT4(Bs[0][OFFSET(b_tile_row + i, b_tile_col, BN)]) =
-            FETCH_FLOAT4(B[OFFSET(b_tile_row + i, b_tile_col, N)]);
+        FETCH_FLOAT4(shared_b[0][OFFSET(b_load_row + i, b_load_col, BLOCK_N)]) =
+            FETCH_FLOAT4(B[OFFSET(b_load_row + i, b_load_col, N)]);
     }
     __syncthreads();
 
-    // ------------------------------
-    // 10. 预加载到寄存器进行首轮计算
-    // ------------------------------
 #pragma unroll
-    for (int m = 0; m < TM; m += 4)
+    for (int m = 0; m < THREAD_M; m += 4)
     {
-        FETCH_FLOAT4(a_frag[0][m]) = FETCH_FLOAT4(As[0][OFFSET(0, ty + m, BM)]);
+        FETCH_FLOAT4(reg_a_tile[0][m]) =
+            FETCH_FLOAT4(shared_a[0][OFFSET(0, local_row_idx + m, BLOCK_M)]);
     }
+
 #pragma unroll
-    for (int n = 0; n < TN; n += 4)
+    for (int n = 0; n < THREAD_N; n += 4)
     {
-        FETCH_FLOAT4(b_frag[0][n]) = FETCH_FLOAT4(Bs[0][OFFSET(0, tx + n, BN)]);
+        FETCH_FLOAT4(reg_b_tile[0][n]) =
+            FETCH_FLOAT4(shared_b[0][OFFSET(0, local_col_idx + n, BLOCK_N)]);
     }
 
     int write_index = 1;
     int load_index;
     int k = 0;
+
     do
     {
-        k += BK;
+        K += BLOCK_K;
         if (k < K)
         {
-            // ---- 加载下一个A/B tile到寄存器
 #pragma unroll
-            for (int i = 0; i < BM; i += a_tile_stride)
+            for (int i = 0; i < BLOCK_M; i += a_load_stride)
             {
-                int ldg_index = i / a_tile_stride * 4;
-                FETCH_FLOAT4(ldg_a_reg[ldg_index]) =
-                    FETCH_FLOAT4(A[OFFSET(a_tile_row + i, k + a_tile_col, K)]);
+                int reg_idx = i / a_load_stride * 4;
+                FETCH_FLOAT4(reg_a_vec[reg_idx]) =
+                    FETCH_FLOAT4(A[OFFSET(a_load_row + i, a_load_col, K)]);
             }
 #pragma unroll
-            for (int i = 0; i < BK; i += b_tile_stride)
+            for (int i = 0; i < BLOCK_K; i += b_load_stride)
             {
-                int ldg_index = i / b_tile_stride * 4;
-                FETCH_FLOAT4(ldg_b_reg[ldg_index]) =
-                    FETCH_FLOAT4(B[OFFSET(k + b_tile_row + i, b_tile_col, N)]);
+                int reg_idx = i / b_load_stride * 4;
+                FETCH_FLOAT4(reg_a_vec[reg_idx]) =
+                    FETCH_FLOAT4(B[OFFSET(b_load_row + i, b_load_col, N)]);
             }
         }
 
-        load_index = write_index ^ 1;
+        load_index = write_index;
 
-        // ------------------------------
-        // 11. 核心计算循环
-        // ------------------------------
 #pragma unroll
-        for (int bk = 0; bk < BK - 1; bk++)
+        for (int bk = 0; bk < BLOCK_K - 1; bk++)
         {
 #pragma unroll
-            for (int m = 0; m < TM; m++)
+            for (int m = 0; m < THREAD_M; m++)
             {
 #pragma unroll
-                for (int n = 0; n < TN; n++)
+                for (int n = 0; n < THREAD_N; n++)
                 {
-                    accum[m][n] += a_frag[bk % 2][m] * b_frag[bk % 2][n];
+                    accum[m][n] += reg_a_tile[bk % 2][m] * reg_b_tile[bk % 2][n];
                 }
             }
         }
 
-        // ------------------------------
-        // 12. 双缓冲写回共享内存
-        // ------------------------------
         if (k < K)
         {
 #pragma unroll
-            for (int i = 0; i < BM; i += a_tile_stride)
+            for (int i = 0; i < BLOCK_M; i += a_load_stride)
             {
-                int ldg_index = i / a_tile_stride * 4;
-                As[write_index][OFFSET(a_tile_col, i + a_tile_row, BM)] = ldg_a_reg[ldg_index];
-                As[write_index][OFFSET(a_tile_col + 1, i + a_tile_row, BM)] =
-                    ldg_a_reg[ldg_index + 1];
-                As[write_index][OFFSET(a_tile_col + 2, i + a_tile_row, BM)] =
-                    ldg_a_reg[ldg_index + 2];
-                As[write_index][OFFSET(a_tile_col + 3, i + a_tile_row, BM)] =
-                    ldg_a_reg[ldg_index + 3];
+                int reg_idx = i / a_load_stride * 4;
+                shared_a[write_index][OFFSET(a_load_col, i + a_load_row, BLOCK_M)] =
+                    reg_a_vec[reg_idx];
+                shared_a[write_index][OFFSET(a_load_col + 1, i + a_load_row, BLOCK_M)] =
+                    reg_a_vec[reg_idx + 1];
+                shared_a[write_index][OFFSET(a_load_col + 2, i + a_load_row, BLOCK_M)] =
+                    reg_a_vec[reg_idx + 2];
+                shared_a[write_index][OFFSET(a_load_col + 3, i + a_load_row, BLOCK_M)] =
+                    reg_a_vec[reg_idx + 3];
             }
 #pragma unroll
-            for (int i = 0; i < BK; i += b_tile_stride)
+            for (int i = 0; i < BLOCK_K; i += b_load_stride)
             {
-                int ldg_index = i / b_tile_stride * 4;
-                FETCH_FLOAT4(Bs[write_index][OFFSET(b_tile_row + i, b_tile_col, BN)]) =
-                    FETCH_FLOAT4(ldg_b_reg[ldg_index]);
+                int reg_idx = i / b_load_stride * 4;
+                FETCH_FLOAT4(shared_b[write_index][OFFSET(b_load_row + i, b_load_col, BLOCK_N)]) =
+                    FETCH_FLOAT4(reg_b_vec[reg_idx]);
             }
             __syncthreads();
             write_index ^= 1;
         }
+    } while (k < K)
 
-    } while (k < K);
-
-    // ------------------------------
-    // 13. 将累加结果写回全局内存
-    // ------------------------------
 #pragma unroll
-    for (int m = 0; m < TM; m++)
+        for (int m = 0; m < THREAD_M; m++)
     {
 #pragma unroll
-        for (int n = 0; n < TN; n += 4)
+        for (int n = 0; n < THREAD_N; n += 4)
         {
-            float4 ctmp = FETCH_FLOAT4(C[OFFSET(ty + m, tx + n, N)]);
-            ctmp.x = alpha * accum[m][n] + beta * ctmp.x;
-            ctmp.y = alpha * accum[m][n + 1] + beta * ctmp.y;
-            ctmp.z = alpha * accum[m][n + 2] + beta * ctmp.z;
-            ctmp.w = alpha * accum[m][n + 3] + beta * ctmp.w;
-            FETCH_FLOAT4(C[OFFSET(ty + m, tx + n, N)]) = ctmp;
+            float4 c_val = FETCH_FLOAT4(C[OFFSET(local_row_idx + m, local_col_idx + n, N)]);
+            // 按 BLAS 规范计算 alpha * A*B + beta * C
+            c_val.x = alpha * accum[m][n] + beta * c_val.x;
+            c_val.y = alpha * accum[m][n + 1] + beta * c_val.y;
+            c_val.z = alpha * accum[m][n + 2] + beta * c_val.z;
+            c_val.w = alpha * accum[m][n + 3] + beta * c_val.w;
+            FETCH_FLOAT4(C[OFFSET(local_row_idx + m, local_col_idx + n, N)]) = c_val;
         }
     }
 }
