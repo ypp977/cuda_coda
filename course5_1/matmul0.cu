@@ -1,16 +1,16 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#include <cmath>   // fabsf() 用于浮点数比较
-#include <fstream> // 文件操作，用于写CSV
+#include <cmath>   // fabsf()：浮点数比较
+#include <fstream> // 文件操作，用于写入 CSV
 #include <iostream>
 #include <vector>
 
-#define BLOCK_SIZE 32 // 每个线程块的尺寸：32x32
+#define BLOCK_SIZE 32 // 每个线程块尺寸（32x32）
 #define TOL 1e-5f     // 浮点误差容忍度
 
 // -----------------------------
-// CUDA 错误检查函数
+// CUDA 错误检查工具函数
 // -----------------------------
 void checkCudaError(cudaError_t err, const char* msg)
 {
@@ -22,7 +22,7 @@ void checkCudaError(cudaError_t err, const char* msg)
 }
 
 // -----------------------------
-// cuBLAS 错误检查函数
+// cuBLAS 错误检查工具函数
 // -----------------------------
 void checkCublasError(cublasStatus_t status, const char* msg)
 {
@@ -34,9 +34,9 @@ void checkCublasError(cublasStatus_t status, const char* msg)
 }
 
 // ----------------------------------------------
-// 手写最基础版 SGEMM 核函数（未优化共享内存）
-// 计算公式：C = α * A × B + β * C
-// 每个线程计算 C 矩阵中的一个元素
+// 基础版手写 SGEMM 核函数（未优化共享内存）
+// 功能：计算 C = α * A × B + β * C
+// 每个线程计算 C 中的一个元素
 // ----------------------------------------------
 __global__ void mysgemm_v0(int M, int N, int K, float alpha, float* A, float* B, float beta,
                            float* C)
@@ -53,40 +53,39 @@ __global__ void mysgemm_v0(int M, int N, int K, float alpha, float* A, float* B,
     for (int i = 0; i < K; i++)
         tmp += A[gy * K + i] * B[i * N + gx];
 
-    // 写回 C
+    // 写回结果
     C[gy * N + gx] = alpha * tmp + beta * C[gy * N + gx];
 }
 
 // ----------------------------------------------
-// 主函数：执行性能测试并写入CSV
+// 主函数：执行 SGEMM 性能测试并记录结果
 // ----------------------------------------------
 int main()
 {
     // -----------------------------
-    // 1. 定义待测试矩阵尺寸（方阵）
+    // 1. 定义测试矩阵尺寸（方阵）
     // -----------------------------
     std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096, 8192};
 
     // -----------------------------
-    // 2. 打开 CSV 文件，用于保存性能结果
+    // 2. 打开 CSV 文件记录性能结果
     // -----------------------------
     std::ofstream csv_file("sgemm_benchmark_V0.csv");
     csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched" << std::endl;
 
     // -----------------------------
-    // 3. 遍历每个矩阵大小进行测试
+    // 3. 遍历不同矩阵大小
     // -----------------------------
     for (int N : sizes)
     {
         std::cout << "Testing size: " << N << std::endl;
-
         size_t size = N * N * sizeof(float);
 
         // -----------------------------
         // 3.1 CPU 内存分配
-        // host_A/B: 输入矩阵
-        // host_C_cublas: cuBLAS 输出
-        // host_C_V0: 手写 SGEMM 输出
+        // host_A/B：输入矩阵
+        // host_C_cublas：cuBLAS 输出
+        // host_C_V0：手写 SGEMM 输出
         // -----------------------------
         float* host_A = (float*)malloc(size);
         float* host_B = (float*)malloc(size);
@@ -106,7 +105,7 @@ int main()
         try
         {
             // -----------------------------
-            // 4. 初始化矩阵数据
+            // 4. 初始化矩阵数据（全 1 或全 2）
             // -----------------------------
             for (int i = 0; i < N * N; i++)
             {
@@ -115,7 +114,7 @@ int main()
             }
 
             // -----------------------------
-            // 5. 拷贝矩阵数据到GPU
+            // 5. 拷贝矩阵数据到 GPU
             // -----------------------------
             checkCudaError(cudaMemcpy(device_A, host_A, size, cudaMemcpyHostToDevice),
                            "cudaMemcpy host_A failed");
@@ -132,14 +131,14 @@ int main()
             float beta = 0.0f;
 
             // -----------------------------
-            // 7. 创建 CUDA 事件用于计时
+            // 7. 创建 CUDA 事件，用于计时
             // -----------------------------
             cudaEvent_t start, stop;
             checkCudaError(cudaEventCreate(&start), "cudaEventCreate(start) failed");
             checkCudaError(cudaEventCreate(&stop), "cudaEventCreate(stop) failed");
 
             // -----------------------------
-            // 8. cuBLAS SGEMM 预热（warm-up）
+            // 8. cuBLAS SGEMM 预热
             // -----------------------------
             int warpup_time = 10;
             for (int i = 0; i < warpup_time; i++)
@@ -225,7 +224,7 @@ int main()
 
             // -----------------------------
             // 15. 写入 CSV
-            // Matched = 1 表示手写结果与 cuBLAS 一致
+            // Matched = 1：手写结果与 cuBLAS 一致
             // -----------------------------
             csv_file << N << "," << cublas_gflops << "," << V0_gflops << ","
                      << (error_count == 0 ? "1" : "0") << std::endl;
@@ -250,7 +249,9 @@ int main()
             out_of_memory = true;
         }
 
-        // 输出当前测试状态
+        // -----------------------------
+        // 输出测试状态
+        // -----------------------------
         if (!out_of_memory)
             std::cout << "Finished size: " << N << std::endl;
         else
