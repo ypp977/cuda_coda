@@ -107,7 +107,7 @@ __global__ void __launch_bounds__(256)
 
     const int b_load_row = threadIdx.x / (BLOCK_N / 4);
     const int b_load_col = (threadIdx.x % (BLOCK_N / 4)) * 4;
-    const int b_load_stride = BLOCK_N / vec4_load_per_thread_b;
+    const int b_load_stride = BLOCK_K / vec4_load_per_thread_b;
 
     // ------------------------------
     // 7. 寄存器缓存
