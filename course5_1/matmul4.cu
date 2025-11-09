@@ -156,6 +156,8 @@ __global__ void __launch_bounds__(256)
     // ------------------------------
     // 10. 寄存器 tile 初始化 (从共享内存加载到寄存器)
     // ------------------------------
+
+    // 10.1 线程加载 A tile 到寄存器
 #pragma unroll
     for (int m = 0; m < THREAD_M; m += 4)
     {
@@ -163,6 +165,7 @@ __global__ void __launch_bounds__(256)
             FETCH_FLOAT4(shared_a[0][OFFSET(0, local_row_idx + m, BLOCK_M)]);
     }
 
+    // 10.2 线程加载 B tile 到寄存器
 #pragma unroll
     for (int n = 0; n < THREAD_N; n += 4)
     {
@@ -184,6 +187,7 @@ __global__ void __launch_bounds__(256)
         if (k < K)
         {
             // ---- 11.1 线程加载下一 A/B tile 到寄存器
+            // 11.1.1 线程加载 A tile 到寄存器
 #pragma unroll
             for (int i = 0; i < BLOCK_M; i += a_load_stride)
             {
@@ -191,7 +195,7 @@ __global__ void __launch_bounds__(256)
                 FETCH_FLOAT4(reg_a_vec[reg_idx]) =
                     FETCH_FLOAT4(A[OFFSET(a_load_row + i, k + a_load_col, K)]);
             }
-
+            // 11.1.2 线程加载 B tile 到寄存器
 #pragma unroll
             for (int i = 0; i < BLOCK_K; i += b_load_stride)
             {
@@ -207,13 +211,14 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
         for (int bk = 0; bk < BLOCK_K - 1; bk++)
         {
+            // 11.2.1 线程将 A tile 写入共享内存
 #pragma unroll
             for (int m = 0; m < THREAD_M; m += 4)
             {
                 FETCH_FLOAT4(reg_a_tile[(bk + 1) % 2][m]) =
                     FETCH_FLOAT4(shared_a[load_index][OFFSET(bk + 1, local_row_idx + m, BLOCK_M)]);
             }
-
+            // 11.2.2 线程将 B tile 写入共享内存
 #pragma unroll
             for (int n = 0; n < THREAD_N; n += 4)
             {
@@ -221,6 +226,7 @@ __global__ void __launch_bounds__(256)
                     FETCH_FLOAT4(shared_b[load_index][OFFSET(bk + 1, local_col_idx + n, BLOCK_N)]);
             }
 
+            // 11.2.3 线程计算 C 子块累加 ----
 #pragma unroll
             for (int m = 0; m < THREAD_M; m++)
             {
@@ -235,6 +241,7 @@ __global__ void __launch_bounds__(256)
         // ---- 11.3 将下一 tile 写入共享内存，切换双缓冲索引 ----
         if (k < K)
         {
+            // 11.3.1 线程将 A tile 写入共享内存
 #pragma unroll
             for (int i = 0; i < BLOCK_M; i += a_load_stride)
             {
@@ -248,7 +255,7 @@ __global__ void __launch_bounds__(256)
                 shared_a[write_index][OFFSET(a_load_col + 3, i + a_load_row, BLOCK_M)] =
                     reg_a_vec[reg_idx + 3];
             }
-
+            // 11.3.2 线程将 B tile 写入共享内存
 #pragma unroll
             for (int i = 0; i < BLOCK_K; i += b_load_stride)
             {
@@ -258,6 +265,9 @@ __global__ void __launch_bounds__(256)
             }
             __syncthreads();
 
+            // ---- 11.4 线程加载下一 A/B tile 到寄存器
+
+            // 11.4.1 线程加载下一 A tile 到寄存器
 #pragma unroll
             for (int m = 0; m < THREAD_M; m += 4)
             {
@@ -265,6 +275,7 @@ __global__ void __launch_bounds__(256)
                     FETCH_FLOAT4(shared_a[write_index][OFFSET(0, local_row_idx + m, BLOCK_M)]);
             }
 
+            // 11.4.2 线程加载下一 B tile 到寄存器
 #pragma unroll
             for (int n = 0; n < THREAD_N; n += 4)
             {
@@ -274,7 +285,7 @@ __global__ void __launch_bounds__(256)
 
             write_index ^= 1; // 切换双缓冲索引
         }
-
+        // 11.4.3 线程计算 C 子块累加
 #pragma unroll
         for (int m = 0; m < THREAD_M; m++)
         {
