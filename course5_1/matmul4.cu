@@ -321,90 +321,62 @@ std::vector<int> generateSizes()
 
 int main()
 {
-    // ------------------------------
-    // 1. 生成测试矩阵尺寸列表
-    // generateSizes() 返回一个 vector<int>，包含待测试的 N（矩阵大小 N x N）
-    // ------------------------------
+    // 生成一组要测试的矩阵尺寸，例如 [128, 256, 512, 1024, ...]
     std::vector<int> sizes = generateSizes();
 
-    // ------------------------------
-    // 2. 打开 CSV 文件，用于保存性能测试结果
-    // 列名包括矩阵大小、cuBLAS GFLOPS、手写 kernel GFLOPS、是否匹配、性能比值
-    // ------------------------------
+    // 打开 CSV 文件，用于记录不同矩阵规模下的性能
     std::ofstream csv_file("sgemm_benchmark_v4.csv");
     csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched,Ratio" << std::endl;
 
-    // ------------------------------
-    // 3. 遍历每个测试矩阵大小
-    // ------------------------------
+    // 遍历每一个矩阵规模进行测试
     for (int N : sizes)
     {
         std::cout << "Testing size " << N << std::endl;
 
-        size_t size = N * N * sizeof(float); // 计算矩阵总字节数
+        // 计算矩阵占用的总字节数（三个 N×N float 矩阵）
+        size_t size = N * N * sizeof(float);
 
-        // ------------------------------
-        // 3.1 CPU 内存分配
-        // host_A、host_B：输入矩阵
-        // host_C_cublas：cuBLAS 输出结果
-        // host_C_v4：手写 kernel 输出结果
-        // ------------------------------
+        // 在主机端分配内存
         float* host_A = (float*)malloc(size);
         float* host_B = (float*)malloc(size);
-        float* host_C_cublas = (float*)malloc(size);
-        float* host_C_v4 = (float*)malloc(size);
+        float* host_C_cublas = (float*)malloc(size); // 用于存放 cuBLAS 计算结果
+        float* host_C_v4 = (float*)malloc(size);     // 用于存放自实现 SGEMM 结果
 
-        // ------------------------------
-        // 3.2 GPU 内存分配
-        // device_a、device_b：输入矩阵
-        // device_c_v4：输出矩阵
-        // ------------------------------
+        // 在 GPU 上分配内存
         float *device_a, *device_b, *device_c_v4;
         checkCudaError(cudaMalloc(&device_a, size), "cudaMalloc device_a  failed");
         checkCudaError(cudaMalloc(&device_b, size), "cudaMalloc device_b  failed");
         checkCudaError(cudaMalloc(&device_c_v4, size), "cudaMalloc device_c_v4 failed");
 
-        bool out_of_memory = false; // 标记是否发生 OOM 或其他异常
+        bool out_of_memory = false;
 
         try
         {
-            // ------------------------------
-            // 4. 初始化矩阵数据
-            // 便于验证结果正确性，这里都用固定值
-            // ------------------------------
+            // 初始化主机矩阵，这里使用简单常数，方便验证正确性
             for (int i = 0; i < N * N; i++)
             {
                 host_A[i] = 1.0f;
                 host_B[i] = 2.0f;
             }
 
-            // ------------------------------
-            // 5. 将矩阵拷贝到 GPU
-            // ------------------------------
+            // 把 A、B 复制到 GPU
             checkCudaError(cudaMemcpy(device_a, host_A, size, cudaMemcpyHostToDevice),
                            "cudaMemcpy host_A to device failed");
             checkCudaError(cudaMemcpy(device_b, host_B, size, cudaMemcpyHostToDevice),
                            "cudaMemcpy host_B to device failed");
 
-            // ------------------------------
-            // 6. 创建 cuBLAS handle
-            // ------------------------------
+            // 创建 cuBLAS 句柄
             cublasHandle_t handle;
             checkCublasError(cublasCreate(&handle), "cublasCreate failed");
 
-            float alpha = 1.0f, beta = 0.0f; // SGEMM 参数 alpha, beta
+            float alpha = 1.0f, beta = 0.0f;
 
-            // ------------------------------
-            // 7. 创建 CUDA 事件，用于计时
-            // ------------------------------
+            // 创建用于测量 GPU 时间的 event
             cudaEvent_t start, stop;
             checkCudaError(cudaEventCreate(&start), "cudaEventCreate start failed");
             checkCudaError(cudaEventCreate(&stop), "cudaEventCreate stop failed");
 
-            // ------------------------------
-            // 8. cuBLAS warmup
-            // 多次执行以稳定 GPU 性能
-            // ------------------------------
+            // -------- Warm-up cuBLAS，避免首次调用偏慢 -------- //
             int warpup_times = 10;
             for (int i = 0; i < warpup_times; i++)
             {
@@ -414,10 +386,8 @@ int main()
             }
             checkCudaError(cudaDeviceSynchronize(), "cudaDeviceSynchronize failed");
 
-            // ------------------------------
-            // 9. cuBLAS 性能测试
-            // ------------------------------
-            int repeat_times = 50; // 重复次数，用于平均性能
+            // -------- 正式计时 cuBLAS -------- //
+            int repeat_times = 50;
             checkCudaError(cudaEventRecord(start), "cudaEventRecord start failed");
             for (int i = 0; i < repeat_times; i++)
             {
@@ -428,32 +398,23 @@ int main()
             checkCudaError(cudaEventRecord(stop), "cudaEventRecord stop failed");
             checkCudaError(cudaEventSynchronize(stop), "cudaEventSynchronize stop failed");
 
+            // 计算 cuBLAS 花费时间（毫秒）
             float cublas_time = 0;
             checkCudaError(cudaEventElapsedTime(&cublas_time, start, stop),
                            "cudaEventElapsedTime failed");
 
-            // ------------------------------
-            // 10. 拷贝 cuBLAS 结果回 CPU
-            // ------------------------------
+            // 取回 cuBLAS 结果，用于正确性比较
             checkCudaError(cudaMemcpy(host_C_cublas, device_c_v4, size, cudaMemcpyDeviceToHost),
                            "cudaMemcpy device_c_v4 to host failed");
 
-            // ------------------------------
-            // 11. 清零输出矩阵，为手写 kernel 做准备
-            // ------------------------------
+            // 清空 C，准备测自实现版本
             checkCudaError(cudaMemset(device_c_v4, 0, size), "cudaMemset device_c_v4 failed");
 
-            // ------------------------------
-            // 12. 设置 kernel 配置
-            // block：每个 block 的线程数
-            // gridDim：计算 grid 的大小
-            // ------------------------------
+            // 配置自定义 kernel 的执行参数
             dim3 block(256);
             dim3 gridDim(CEIL_DIV(N, 128), CEIL_DIV(N, 128));
 
-            // ------------------------------
-            // 13. 手写 kernel warmup
-            // ------------------------------
+            // -------- Warm-up 自定义 SGEMM -------- //
             for (int i = 0; i < warpup_times; i++)
             {
                 mysgemm_v4<128, 128, 8, 8, 8>
@@ -461,9 +422,7 @@ int main()
             }
             checkCudaError(cudaDeviceSynchronize(), "cudaDeviceSynchronize failed");
 
-            // ------------------------------
-            // 14. 手写 kernel 性能测试
-            // ------------------------------
+            // -------- 正式计时自实现 SGEMM -------- //
             checkCudaError(cudaEventRecord(start), "cudaEventRecord start failed");
             for (int i = 0; i < repeat_times; i++)
             {
@@ -478,16 +437,11 @@ int main()
             checkCudaError(cudaEventElapsedTime(&v4_time, start, stop),
                            "cudaEventElapsedTime failed");
 
-            // ------------------------------
-            // 15. 拷贝手写 kernel 结果回 CPU
-            // ------------------------------
+            // 取回自实现的 C 进行正确性验证
             checkCudaError(cudaMemcpy(host_C_v4, device_c_v4, size, cudaMemcpyDeviceToHost),
                            "cudaMemcpy device_c_v4 to host failed");
 
-            // ------------------------------
-            // 16. 检查结果匹配性
-            // TOL 为容忍误差
-            // ------------------------------
+            // 简单比较前 10 个元素，验证是否数值一致
             int error_count = 0;
             for (int i = 0; i < N * N && error_count < 10; i++)
             {
@@ -497,23 +451,16 @@ int main()
                 }
             }
 
-            // ------------------------------
-            // 17. 计算 GFLOPS
-            // ------------------------------
+            // 计算 GFLOPS（公式：2*N³ / 时间）
             float cublas_gflops = (repeat_times * 2.0f * N * N * N) / (1e6f * cublas_time);
             float v4_gflops = (repeat_times * 2.0f * N * N * N) / (1e6f * v4_time);
             float ratio = v4_gflops / cublas_gflops;
 
-            // ------------------------------
-            // 18. 写入 CSV 文件
-            // Matched: 1 表示结果一致，0 表示不一致
-            // ------------------------------
+            // 将结果写入 CSV
             csv_file << N << "," << cublas_gflops << "," << v4_gflops << ","
                      << (error_count == 0 ? "1" : "0") << "," << ratio << std::endl;
 
-            // ------------------------------
-            // 19. 释放资源
-            // ------------------------------
+            // 回收资源
             cublasDestroy(handle);
             cudaEventDestroy(start);
             cudaEventDestroy(stop);
@@ -530,23 +477,17 @@ int main()
         }
         catch (...)
         {
-            // 捕获异常（如 OOM）并记录
+            // 如果发生内存不足（OOM）则记录并继续下一个尺寸
             std::cerr << "Out of memory or error during testing size: " << N << std::endl;
             out_of_memory = true;
         }
 
-        // ------------------------------
-        // 20. 输出当前测试状态
-        // ------------------------------
         if (!out_of_memory)
             std::cout << "Finished size: " << N << std::endl;
         else
             csv_file << N << ",OOM,OOM,0" << std::endl;
     }
 
-    // ------------------------------
-    // 21. 关闭 CSV 文件
-    // ------------------------------
     csv_file.close();
     std::cout << "Benchmark completed. Results saved to 'sgemm_benchmarkV4.csv'" << std::endl;
 
