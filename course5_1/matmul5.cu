@@ -60,8 +60,7 @@ __device__ void load_from_gmem(int N, int K, const float* A, const float* B, flo
     for (uint off_set = 0; off_set + row_stride_a <= BM; off_set += row_stride_a)
     {
         // 使用float4向量化加载4个float元素
-        const float4 tmp =
-            reinterpret_cast<const float4*>(&A[(inner_row_a + off_set) * K + inner_col_a * 4])[0];
+        const float4 tmp = reinterpret_cast<const float4*>(&A[(inner_row_a + off_set) * K + inner_col_a * 4])[0];
 
         // 转置存储到共享内存，优化后续访问模式
         As[(inner_col_a * 4 + 0) * BM + inner_row_a + off_set] = tmp.x;
