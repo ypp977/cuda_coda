@@ -34,7 +34,7 @@ load_from_gmem: 从全局内存加载数据到共享内存
 ------------------------------------------------------------
 
 模板参数:
-    BM, BN, BK           : Block级别tile大小
+    BLOCK_M, BLOCK_N, BLOCK_K           : Block级别tile大小
     row_stride_a, row_stride_b : 加载A和B时的行步长
 
 函数参数:
@@ -50,32 +50,34 @@ load_from_gmem: 从全局内存加载数据到共享内存
 3. As采用转置存储以优化后续访问模式
 ------------------------------------------------------------
 */
-template <const int BM, const int BN, const int BK, const int row_stride_a, const int row_stride_b>
+template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int row_stride_a,
+          const int row_stride_b>
 __device__ void load_from_gmem(int N, int K, const float* A, const float* B, float* As, float* Bs,
                                int inner_row_a, int inner_col_a, int inner_row_b, int inner_col_b)
 {
     // ------------------------------
     // 1. 加载A矩阵tile到共享内存(转置存储)
     // ------------------------------
-    for (uint off_set = 0; off_set + row_stride_a <= BM; off_set += row_stride_a)
+    for (uint off_set = 0; off_set + row_stride_a <= BLOCK_M; off_set += row_stride_a)
     {
         // 使用float4向量化加载4个float元素
-        const float4 tmp = reinterpret_cast<const float4*>(&A[(inner_row_a + off_set) * K + inner_col_a * 4])[0];
+        const float4 tmp =
+            reinterpret_cast<const float4*>(&A[(inner_row_a + off_set) * K + inner_col_a * 4])[0];
 
         // 转置存储到共享内存，优化后续访问模式
-        As[(inner_col_a * 4 + 0) * BM + inner_row_a + off_set] = tmp.x;
-        As[(inner_col_a * 4 + 1) * BM + inner_row_a + off_set] = tmp.y;
-        As[(inner_col_a * 4 + 2) * BM + inner_row_a + off_set] = tmp.z;
-        As[(inner_col_a * 4 + 3) * BM + inner_row_a + off_set] = tmp.w;
+        As[(inner_col_a * 4 + 0) * BLOCK_M + inner_row_a + off_set] = tmp.x;
+        As[(inner_col_a * 4 + 1) * BLOCK_M + inner_row_a + off_set] = tmp.y;
+        As[(inner_col_a * 4 + 2) * BLOCK_M + inner_row_a + off_set] = tmp.z;
+        As[(inner_col_a * 4 + 3) * BLOCK_M + inner_row_a + off_set] = tmp.w;
     }
 
     // ------------------------------
     // 2. 加载B矩阵tile到共享内存(按原始布局存储)
     // ------------------------------
-    for (uint off_set = 0; off_set + row_stride_b <= BK; off_set += row_stride_b)
+    for (uint off_set = 0; off_set + row_stride_b <= BLOCK_K; off_set += row_stride_b)
     {
         // 使用float4向量化加载B矩阵数据
-        reinterpret_cast<float4*>(&Bs[(inner_row_b + off_set) * BN + inner_col_b * 4])[0] =
+        reinterpret_cast<float4*>(&Bs[(inner_row_b + off_set) * BLOCK_N + inner_col_b * 4])[0] =
             reinterpret_cast<const float4*>(&B[(inner_row_b + off_set) * N + inner_col_b * 4])[0];
     }
 }
@@ -86,7 +88,7 @@ process_from_smem: 在共享内存中处理矩阵乘法计算
 ------------------------------------------------------------
 
 模板参数:
-    BM, BN, BK     : Block级别tile大小
+    BLOCK_M, BLOCK_N, BLOCK_K     : Block级别tile大小
     WM, WN         : Warp级别tile大小
     WMITER, WNITER : Warp内部迭代次数
     WSUBM, WSUBN   : Warp子tile大小
@@ -106,8 +108,9 @@ process_from_smem: 在共享内存中处理矩阵乘法计算
 4. 累加结果到thread_results
 ------------------------------------------------------------
 */
-template <const int BM, const int BN, const int BK, const int WM, const int WN, const int WMITER,
-          const int WNITER, const int WSUBM, const int WSUBN, const int TM, const int TN>
+template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int WM, const int WN,
+          const int WMITER, const int WNITER, const int WSUBM, const int WSUBN, const int TM,
+          const int TN>
 __device__ void process_from_smem(float* reg_m, float* reg_n, float* thread_results,
                                   const float* As, const float* Bs, const uint warp_row,
                                   const uint warp_col, const uint thread_row_in_warp,
@@ -116,7 +119,7 @@ __device__ void process_from_smem(float* reg_m, float* reg_n, float* thread_resu
     // ------------------------------
     // 1. 沿K维度迭代计算点积
     // ------------------------------
-    for (uint dot_idx = 0; dot_idx < BK; ++dot_idx)
+    for (uint dot_idx = 0; dot_idx < BLOCK_K; ++dot_idx)
     {
         // ------------------------------
         // 2. 加载A矩阵数据到寄存器
@@ -126,7 +129,7 @@ __device__ void process_from_smem(float* reg_m, float* reg_n, float* thread_resu
             for (uint i = 0; i < TM; ++i)
             {
                 reg_m[w_sub_row_idx * TM + i] =
-                    As[(dot_idx * BM) + warp_row * WM + w_sub_row_idx * WSUBM +
+                    As[(dot_idx * BLOCK_M) + warp_row * WM + w_sub_row_idx * WSUBM +
                        thread_row_in_warp * TM + i];
             }
         }
@@ -139,7 +142,7 @@ __device__ void process_from_smem(float* reg_m, float* reg_n, float* thread_resu
             for (uint i = 0; i < TN; ++i)
             {
                 reg_n[w_sub_col_idx * TN + i] =
-                    Bs[(dot_idx * BN) + warp_col * WN + w_sub_col_idx * WSUBN +
+                    Bs[(dot_idx * BLOCK_N) + warp_col * WN + w_sub_col_idx * WSUBN +
                        thread_col_in_warp * TN + i];
             }
         }
@@ -175,7 +178,7 @@ mysgemm_warptiling: 使用warp级别tiling的SGEMM kernel (C = alpha * A * B + b
 ------------------------------------------------------------
 
 模板参数:
-    BM, BN, BK : Block级别tile大小
+    BLOCK_M, BLOCK_N, BLOCK_K : Block级别tile大小
     WM, WN     : Warp级别tile大小
     WNITER     : Warp内部列迭代次数
     TM, TN     : Thread级别tile大小
@@ -195,130 +198,59 @@ mysgemm_warptiling: 使用warp级别tiling的SGEMM kernel (C = alpha * A * B + b
 5. 最后将寄存器结果按alpha/beta写回全局内存
 ------------------------------------------------------------
 */
-template <const int BM, const int BN, const int BK, const int WM, const int WN, const int WNITER,
-          const int TM, const int TN, const int NUM_THREADS>
+template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int WARP_M,
+          const int WARP_N, const int WARP_N_ITER, const int THREAD_TILE_M, const int THREAD_TILE_N,
+          const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
     mysgemm_warptiling(int M, int N, int K, float alpha, float* A, float* B, float beta, float* C)
 {
     // ------------------------------
-    // 1. 当前 block 在 C 矩阵中的 tile 坐标
+    // 1. 计算 block 和 warp 在整体矩阵中的tile 位置
     // ------------------------------
-    const uint c_row = blockIdx.y; // block 对应的行块索引
-    const uint c_col = blockIdx.x; // block 对应的列块索引
+    // blockTile(row,col) 表示 Block 负责的 c 子矩阵块 (BLOCK_M x BLOCK_N)
+    const uint block_tile_row = blockIdx.x;
+    const uint block_tile_col = blockIdx.y;
 
-    // ------------------------------
-    // 2. 计算当前warp在block中的位置
-    // ------------------------------
-    const uint warp_idx = threadIdx.x / WARP_SIZE; // 当前线程所属warp的索引
-    const uint warp_col = warp_idx % (BN / WN);    // warp在block中的列位置
-    const uint warp_row = warp_idx / (BN / WN);    // warp在block中的行位置
+    // warp 线性编号（按线程ID 分组）
+    const uint warp_id_in_block = threadIdx.x / WARP_SIZE;
+    // Block 中按 N 方向能容纳多少 warp tile
+    const uint warps_per_block_n = BLOCK_N / WARP_N;
+    // warp 在 block 内的二维坐标
+    const uint warp_tile_col = warp_id_in_block % warps_per_block_n;
+    const uint warp_tile_row = warp_id_in_block / warps_per_block_n;
 
-    // ------------------------------
-    // 3. 计算warp内部迭代参数
-    // ------------------------------
-    constexpr uint WMITER = (WM * WN) / (WARP_SIZE * TM * TN * WNITER); // 行方向迭代次数
-    constexpr uint WSUBM = WM / WMITER;                                 // warp子块行大小
-    constexpr uint WSUBN = WN / WNITER;                                 // warp子块列大小
+    constexpr uint WARP_M_ITER =
+        (WARP_M * WARP_N) / (WARP_SIZE * THREAD_TILE_M * THREAD_TILE_N * WARP_N_ITER);
 
-    // ------------------------------
-    // 4. 计算线程在warp内部的位置
-    // ------------------------------
-    const uint thread_idx_in_warp = threadIdx.x % WARP_SIZE;           // 线程在warp内的索引
-    const uint thread_col_in_warp = thread_idx_in_warp % (WSUBN / TN); // 线程在warp内的列位置
-    const uint thread_row_in_warp = thread_idx_in_warp / (WSUBN / TN); // 线程在warp内的行位置
+    const uint WARP_SUB_TILE_M = WARP_M / WARP_M_ITER;
+    const uint WARP_SUB_TILE_N = WARP_N / WARP_N_ITER;
 
-    // ------------------------------
-    // 5. 分配共享内存用于缓存 A/B tile
-    // ------------------------------
-    __shared__ float As[BM * BK]; // A矩阵的共享内存缓存
-    __shared__ float Bs[BK * BN]; // B矩阵的共享内存缓存
+    const uint lane_id = threadIdx.x % WARP_SIZE;
 
-    // ------------------------------
-    // 6. 将 A/B/C 指针偏移到当前 block 对应子矩阵
-    // ------------------------------
-    A += c_row * BM * K;                                                // A 的行偏移
-    B += c_col * BN;                                                    // B 的列偏移
-    C += (c_row * BM + warp_row * WM) * N + c_col * BN + warp_col * WN; // C 的偏移
+    const uint thread_tile_col = lane_id % (WARP_SUB_TILE_N / THREAD_TILE_N);
+    const uint thread_tile_row = lane_id / (WARP_SUB_TILE_N / THREAD_TILE_N);
 
-    // ------------------------------
-    // 7. 计算线程加载 A/B 的行列起点
-    // ------------------------------
-    const uint inner_row_a = threadIdx.x / (BK / 4);      // A加载的行起点
-    const uint inner_col_a = threadIdx.x % (BK / 4);      // A加载的列起点(4元素对齐)
-    constexpr uint row_stride_a = (NUM_THREADS * 4) / BK; // A加载的行步长
+    __shared__ float shared_a[BLOCK_M * BLOCK_K];
+    __shared__ float shared_b[BLOCK_K * BLOCK_N];
 
-    const uint inner_row_b = threadIdx.x / (BN / 4);      // B加载的行起点
-    const uint inner_col_b = threadIdx.x % (BN / 4);      // B加载的列起点(4元素对齐)
-    constexpr uint row_stride_b = NUM_THREADS / (BN / 4); // B加载的行步长
+    A += block_tile_row * BLOCK_M * K;
+    B += block_tile_col * BLOCK_N;
 
-    // ------------------------------
-    // 8. 分配寄存器用于缓存计算数据
-    // ------------------------------
-    float thread_results[WMITER * TM * WNITER * TN] = {0.0}; // 存放线程计算结果
-    float reg_m[WMITER * TM] = {0.0};                        // 存放A矩阵数据
-    float reg_n[WNITER * TN] = {0.0};                        // 存放B矩阵数据
+    C += (block_tile_row * BLOCK_M + warp_tile_row * WARP_M) * N + block_tile_col * BLOCK_N +
+         warp_tile_col * WARP_N;
 
-    // ------------------------------
-    // 9. 沿K方向分块处理矩阵乘法
-    // ------------------------------
-    for (uint bk_idx = 0; bk_idx < K; bk_idx += BK)
-    {
-        // 从全局内存加载数据到共享内存
-        load_from_gmem<BM, BN, BK, row_stride_a, row_stride_b>(
-            N, K, A, B, As, Bs, inner_row_a, inner_col_a, inner_row_b, inner_col_b);
-        __syncthreads();
+    const uint load_a_row = threadIdx.x / (BLOCK_K / 4);
+    const uint load_a_col = threadIdx.x % (BLOCK_K / 4);
+    constexpr uint load_a_row_stride = (NUM_THREADS * 4) / BLOCK_K;
 
-        // 在共享内存中处理矩阵乘法计算
-        process_from_smem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
-            reg_m, reg_n, thread_results, As, Bs, warp_row, warp_col, thread_row_in_warp,
-            thread_col_in_warp);
+    const uint load_b_row = threadIdx.x / (BLOCK_N / 4);
+    const uint load_b_col = threadIdx.x % (BLOCK_N / 4);
+    constexpr uint load_b_row_stride = NUM_THREADS / (BLOCK_N / 4);
 
-        // 移动到下一个K分块
-        A += BK;
-        B += BK * N;
-        __syncthreads();
-    }
+    float accum_frag[WARP_M_ITER * THREAD_TILE_M * WARP_N_ITER * THREAD_TILE_N] = {0.0f};
 
-    // ------------------------------
-    // 10. 将累加结果写回全局内存
-    // 按 BLAS 规范执行 alpha * A*B + beta * C
-    // 使用 float4 向量化写回
-    // ------------------------------
-    for (uint w_sub_row_idx = 0; w_sub_row_idx < WMITER; ++w_sub_row_idx)
-    {
-        for (uint w_sub_col_idx = 0; w_sub_col_idx < WNITER; ++w_sub_col_idx)
-        {
-            // 计算当前子块在C中的位置
-            float* C_interim = C + (w_sub_row_idx * WSUBM) * N + w_sub_col_idx * WSUBN;
-
-            // 向量化写回结果
-            for (uint res_idx_m = 0; res_idx_m < TM; res_idx_m += 1)
-            {
-                for (uint res_idx_n = 0; res_idx_n < TN; res_idx_n += 4)
-                {
-                    // 读取C中的原始值
-                    float4 tmp = reinterpret_cast<float4*>(
-                        &C_interim[(thread_row_in_warp * TM + res_idx_m) * N +
-                                   thread_col_in_warp * TN + res_idx_n])[0];
-
-                    // 计算索引
-                    const int i = (w_sub_row_idx * TM + res_idx_m) * (WNITER * TN) +
-                                  w_sub_col_idx * TN + res_idx_n;
-
-                    // 按BLAS规范计算: C = alpha * A * B + beta * C
-                    tmp.x = alpha * thread_results[i + 0] + beta * tmp.x;
-                    tmp.y = alpha * thread_results[i + 1] + beta * tmp.y;
-                    tmp.z = alpha * thread_results[i + 2] + beta * tmp.z;
-                    tmp.w = alpha * thread_results[i + 3] + beta * tmp.w;
-
-                    // 写回结果
-                    reinterpret_cast<float4*>(&C_interim[(thread_row_in_warp * TM + res_idx_m) * N +
-                                                         thread_col_in_warp * TN + res_idx_n])[0] =
-                        tmp;
-                }
-            }
-        }
-    }
+    float reg_tile_a[WARP_M_ITER * THREAD_TILE_M] = {0.0f};
+    float reg_tile_b[WARP_N_ITER * THREAD_TILE_N] = {0.0f};
 }
 
 // 生成测试矩阵大小
@@ -458,13 +390,13 @@ int main()
                           "issues during GMEM->SMEM tiling (loading only parts of the "
                           "final row of As during each iteration)");
             static_assert(K10_BN % (16 * K10_TN) == 0,
-                          "BN must be a multiple of 16*TN to avoid quantization effects");
+                          "BLOCK_N must be a multiple of 16*TN to avoid quantization effects");
             static_assert(K10_BM % (16 * K10_TM) == 0,
-                          "BM must be a multiple of 16*TM to avoid quantization effects");
+                          "BLOCK_M must be a multiple of 16*TM to avoid quantization effects");
             static_assert((K10_BM * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                          "BM*BK must be a multiple of 4*256 to vectorize loads");
+                          "BLOCK_M*BLOCK_K must be a multiple of 4*256 to vectorize loads");
             static_assert((K10_BN * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                          "BN*BK must be a multiple of 4*256 to vectorize loads");
+                          "BLOCK_N*BLOCK_K must be a multiple of 4*256 to vectorize loads");
 
             dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(N, K10_BM));
 
