@@ -77,8 +77,7 @@ __device__ void load_from_gmem(int N, int K, const float* A, const float* B, flo
     for (uint off_set = 0; off_set + row_stride_b <= BLOCK_K; off_set += row_stride_b)
     {
         // 使用float4向量化加载B矩阵数据
-        reinterpret_cast<float4*>(&Bs[(inner_row_b + off_set) * BLOCK_N + inner_col_b * 4])[0] = 
-reinterpret_cast<const float4*>(&B[(inner_row_b + off_set) * N + inner_col_b * 4])[0];
+        reinterpret_cast<float4*>(&Bs[(inner_row_b + off_set) * BLOCK_N + inner_col_b * 4])[0] = reinterpret_cast<const float4*>(&B[(inner_row_b + off_set) * N + inner_col_b * 4])[0];
     }
 }
 
