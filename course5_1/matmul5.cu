@@ -58,8 +58,7 @@ __device__ void load_from_gmem(int N, int K, const float* A, const float* B, flo
     // ------------------------------
     // 1. 加载A矩阵tile到共享内存(转置存储)
     // ------------------------------
-    for (uint off_set = 0; off_set + row_stride_a <= BLOCK_M; off_set += row_stride_a)
-    {
+    for (uint off_set = 0; off_set + row_stride_a <= BLOCK_M; off_set += row_stride_a){
         // 使用float4向量化加载4个float元素
         const float4 tmp =
             reinterpret_cast<const float4*>(&A[(inner_row_a + off_set) * K + inner_col_a * 4])[0];
