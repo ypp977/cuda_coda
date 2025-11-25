@@ -58,7 +58,8 @@ __device__ void load_from_gmem(int N, int K, const float* A, const float* B, flo
     // ------------------------------
     // 1. 加载A矩阵tile到共享内存(转置存储)
     // ------------------------------
-    for (uint off_set = 0; off_set + row_stride_a <= BLOCK_M; off_set += row_stride_a){
+    for (uint off_set = 0; off_set + row_stride_a <= BLOCK_M; off_set += row_stride_a)
+    {
         // 使用float4向量化加载4个float元素
         const float4 tmp =
             reinterpret_cast<const float4*>(&A[(inner_row_a + off_set) * K + inner_col_a * 4])[0];
@@ -76,7 +77,8 @@ __device__ void load_from_gmem(int N, int K, const float* A, const float* B, flo
     for (uint off_set = 0; off_set + row_stride_b <= BLOCK_K; off_set += row_stride_b)
     {
         // 使用float4向量化加载B矩阵数据
-        reinterpret_cast<float4*>(&Bs[(inner_row_b + off_set) * BLOCK_N + inner_col_b * 4])[0] = reinterpret_cast<const float4*>(&B[(inner_row_b + off_set) * N + inner_col_b * 4])[0];
+        reinterpret_cast<float4*>(&Bs[(inner_row_b + off_set) * BLOCK_N + inner_col_b * 4])[0] =
+            reinterpret_cast<const float4*>(&B[(inner_row_b + off_set) * N + inner_col_b * 4])[0];
     }
 }
 
@@ -172,30 +174,62 @@ constexpr int WARP_SIZE = 32;
 
 /*
 ------------------------------------------------------------
-mysgemm_warptiling: 使用warp级别tiling的SGEMM kernel (C = alpha * A * B + beta * C)
+模块名：mysgemm_warptiling
 ------------------------------------------------------------
+1. 功能：
+   - 使用三层 tiling（Block / Warp / Thread）实现高性能 SGEMM：
+       C = alpha * A * B + beta * C
+   - 矩阵均为 row-major（行主序）存储。
 
-模板参数:
-    BLOCK_M, BLOCK_N, BLOCK_K : Block级别tile大小
-    WM, WN     : Warp级别tile大小
-    WNITER     : Warp内部列迭代次数
-    TM, TN     : Thread级别tile大小
-    NUM_THREADS: 每个block的线程数
+2. 模板参数：
+   - BLOCK_M, BLOCK_N, BLOCK_K：
+     Block 级 tile 尺寸。单个 block 负责计算
+     C 的一个 BLOCK_M（行）× BLOCK_N（列）子矩阵，
+     并沿 K 方向以 BLOCK_K 为深度分块累加。
+   - WARP_M, WARP_N：
+     Warp 级 tile 尺寸。单个 warp 在 block 内负责计算
+     C 的一个 WARP_M × WARP_N 子矩阵。
+   - WARP_N_ITER：
+     Warp 在 N 方向对子 tile 的迭代次数，
+     用于覆盖完整的 WARP_N 宽度（一次迭代处理 WARP_SUB_TILE_N 列）。
+   - THREAD_TILE_M, THREAD_TILE_N：
+     Thread 级 tile 尺寸。单线程在一次子 tile 迭代中
+     负责输出 THREAD_TILE_M × THREAD_TILE_N 个 C 元素。
+   - NUM_THREADS：
+     每个 block 的线程总数，需为 WARP_SIZE 的整数倍，
+     并与 BLOCK/WARP/THREAD tile 的拆分关系匹配。
 
-函数参数:
-    M, N, K    : 矩阵维度 (A[MxK], B[KxN], C[MxN])
-    alpha, beta: 缩放系数
-    A, B       : 输入矩阵 (Row-major)
-    C          : 输出矩阵
+3. 函数参数：
+   - M, N, K：
+     矩阵维度，A[M × K]，B[K × N]，C[M × N]，均为 row-major。
+   - alpha, beta：
+     标量系数，最终计算：
+       C = alpha * (A * B) + beta * C
+   - A, B：
+     输入矩阵首地址（row-major）：
+       · A 行跨度为 K
+       · B 行跨度为 N
+   - C：
+     输出/输入矩阵首地址（row-major），行跨度为 N。
 
-算法核心:
-1. 使用三级tiling结构：Block -> Warp -> Thread
-2. 利用warp级别tiling优化共享内存访问
-3. 使用寄存器缓存提高计算效率
-4. 沿K方向分块处理避免共享内存容量限制
-5. 最后将寄存器结果按alpha/beta写回全局内存
+4. 算法步骤（沿 K 方向分块累加）：
+   1) 将 C 按 BLOCK_M × BLOCK_N 划分为 block tile，每个 block 负责一个 tile。
+   2) block 内将该 tile 进一步划分为多个 WARP_M × WARP_N 的 warp tile。
+   3) 对每个 K 分块：
+        a. 所有线程协同将 A 的 BLOCK_M × BLOCK_K 子块、
+           B 的 BLOCK_K × BLOCK_N 子块搬运到共享内存。
+        b. 每个线程从共享内存读取自身负责的 A/B 局部片段到寄存器。
+        c. 在寄存器中完成 FMA 累加，更新本线程的 accum_frag。
+   4) 所有 K 分块累加完毕后，将 accum_frag 按 alpha/beta 写回 C。
+
+5. 使用注意：
+   - BLOCK/WARP/THREAD tile 之间需满足整除与覆盖关系，
+     以保证 lane / thread 的映射合法且共享内存访问不越界。
+   - 若使用 float4 向量化加载，A/B 对应地址需保证 16B 对齐，
+     否则会影响性能或触发未对齐访问。
 ------------------------------------------------------------
 */
+
 template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int WARP_M,
           const int WARP_N, const int WARP_N_ITER, const int THREAD_TILE_M, const int THREAD_TILE_N,
           const int NUM_THREADS>
@@ -203,52 +237,139 @@ __global__ void __launch_bounds__(NUM_THREADS)
     mysgemm_warptiling(int M, int N, int K, float alpha, float* A, float* B, float beta, float* C)
 {
     // ------------------------------
-    // 1. 计算 block 和 warp 在整体矩阵中的tile 位置
+    // 1. Block / Warp 级 tile 在 C 中的定位
     // ------------------------------
-    // blockTile(row,col) 表示 Block 负责的 c 子矩阵块 (BLOCK_M x BLOCK_N)
-    const uint block_tile_row = blockIdx.x;
-    const uint block_tile_col = blockIdx.y;
+    // block_tile_row / block_tile_col：
+    //   当前 block 负责的 C 子矩阵 tile 的二维索引（单位：BLOCK_M × BLOCK_N）
+    const uint block_tile_row = blockIdx.x; // block 在 M 方向的 tile 索引
+    const uint block_tile_col = blockIdx.y; // block 在 N 方向的 tile 索引
 
-    // warp 线性编号（按线程ID 分组）
+    // warp_id_in_block：
+    //   当前线程所在 warp 在 block 内的一维编号（WARP_SIZE=32）
     const uint warp_id_in_block = threadIdx.x / WARP_SIZE;
-    // Block 中按 N 方向能容纳多少 warp tile
-    const uint warps_per_block_n = BLOCK_N / WARP_N;
-    // warp 在 block 内的二维坐标
-    const uint warp_tile_col = warp_id_in_block % warps_per_block_n;
-    const uint warp_tile_row = warp_id_in_block / warps_per_block_n;
 
+    // warps_per_block_n：
+    //   当前 block 在 N 方向可容纳的 warp tile 数量
+    //   每个 warp 计算一个 WARP_M × WARP_N 的 C 子块
+    const uint warps_per_block_n = BLOCK_N / WARP_N;
+
+    // warp_tile_row / warp_tile_col：
+    //   warp 在 block 内的二维 tile 坐标
+    const uint warp_tile_col = warp_id_in_block % warps_per_block_n; // warp 在 N 方向的序号
+    const uint warp_tile_row = warp_id_in_block / warps_per_block_n; // warp 在 M 方向的序号
+
+    // ------------------------------
+    // 2. Warp 内 tiling：子 tile 与 thread tile 划分
+    // ------------------------------
+    // WARP_M_ITER：
+    //   warp 在 M 方向的子 tile 迭代次数。
+    //   约束关系：
+    //     WARP_M * WARP_N
+    //       = WARP_SIZE * THREAD_TILE_M * THREAD_TILE_N
+    //         * WARP_M_ITER * WARP_N_ITER
+    //   即：warp 的输出元素总数 = 32 个线程在所有子 tile 迭代中输出元素数之和。
     constexpr uint WARP_M_ITER =
         (WARP_M * WARP_N) / (WARP_SIZE * THREAD_TILE_M * THREAD_TILE_N * WARP_N_ITER);
 
-    const uint WARP_SUB_TILE_M = WARP_M / WARP_M_ITER;
-    const uint WARP_SUB_TILE_N = WARP_N / WARP_N_ITER;
+    // WARP_SUB_TILE_M / WARP_SUB_TILE_N：
+    //   warp 单次子 tile 迭代在 M/N 方向覆盖的输出尺寸
+    const uint WARP_SUB_TILE_M = WARP_M / WARP_M_ITER; // 单次迭代覆盖的行数
+    const uint WARP_SUB_TILE_N = WARP_N / WARP_N_ITER; // 单次迭代覆盖的列数
 
+    // lane_id：
+    //   线程在其所属 warp 内的局部编号 [0, WARP_SIZE)
     const uint lane_id = threadIdx.x % WARP_SIZE;
 
+    // thread_tile_col：
+    //   当前线程在 warp 子 tile 内的 thread tile 列索引。
+    //   N 方向每行需要 T_N = WARP_SUB_TILE_N / THREAD_TILE_N 个 thread tile，
+    //   lane_id 先在 N 方向铺满一行，再换行，因此列号取 lane_id % T_N。
     const uint thread_tile_col = lane_id % (WARP_SUB_TILE_N / THREAD_TILE_N);
+
+    // thread_tile_row：
+    //   当前线程在 warp 子 tile 内的 thread tile 行索引。
+    //   采用 row-major 映射：每行有 T_N 个 thread tile，
+    //   所以行号为 lane_id / T_N。
     const uint thread_tile_row = lane_id / (WARP_SUB_TILE_N / THREAD_TILE_N);
 
+    // ------------------------------
+    // 3. Block 级共享内存：缓存 A / B 的 K 方向子块
+    // ------------------------------
+    // shared_a：
+    //   缓存 A 的一个 BLOCK_M × BLOCK_K 子块（row-major 展平）
     __shared__ float shared_a[BLOCK_M * BLOCK_K];
+
+    // shared_b：
+    //   缓存 B 的一个 BLOCK_K × BLOCK_N 子块（row-major 展平）
     __shared__ float shared_b[BLOCK_K * BLOCK_N];
 
+    // ------------------------------
+    // 4. 全局内存指针偏移到当前 Block / Warp 对应的子矩阵
+    // ------------------------------
+    // A 偏移到当前 block 负责的 A tile 左上角：
+    //   起始行 = block_tile_row * BLOCK_M，起始列 = 0
     A += block_tile_row * BLOCK_M * K;
+
+    // B 偏移到当前 block 负责的 B tile 左上角：
+    //   起始行 = 0，起始列 = block_tile_col * BLOCK_N
     B += block_tile_col * BLOCK_N;
 
+    // C 偏移到当前 warp 负责写回的 C warp tile 左上角：
+    //   起始行 = block_tile_row * BLOCK_M + warp_tile_row * WARP_M
+    //   起始列 = block_tile_col * BLOCK_N + warp_tile_col * WARP_N
     C += (block_tile_row * BLOCK_M + warp_tile_row * WARP_M) * N + block_tile_col * BLOCK_N +
          warp_tile_col * WARP_N;
 
-    const uint load_a_row = threadIdx.x / (BLOCK_K / 4);
-    const uint load_a_col = threadIdx.x % (BLOCK_K / 4);
+    // ------------------------------
+    // 5. A 子块加载索引（按 float4 向量化加载布局）
+    // ------------------------------
+    // 将 BLOCK_M × BLOCK_K 的 A tile 视为：
+    //   BLOCK_M 行 × (BLOCK_K / 4) 列 float4 向量
+    const uint load_a_row = threadIdx.x / (BLOCK_K / 4); // 负责的“向量行”索引
+    const uint load_a_col = threadIdx.x % (BLOCK_K / 4); // 负责的“向量列”索引（float4）
+
+    // load_a_row_stride：
+    //   覆盖完整 A tile 时，相邻两轮加载在行方向上的步长（单位：行）
+    //   一轮所有线程共加载 NUM_THREADS * 4 个 float，
+    //   按 K 方向长度 BLOCK_K 展开，相当于加载 (NUM_THREADS*4 / BLOCK_K) 行。
     constexpr uint load_a_row_stride = (NUM_THREADS * 4) / BLOCK_K;
 
-    const uint load_b_row = threadIdx.x / (BLOCK_N / 4);
-    const uint load_b_col = threadIdx.x % (BLOCK_N / 4);
+    // ------------------------------
+    // 6. B 子块加载索引（按 float4 向量化加载布局）
+    // ------------------------------
+    // 将 BLOCK_K × BLOCK_N 的 B tile 视为：
+    //   BLOCK_K 行 × (BLOCK_N / 4) 列 float4 向量
+    const uint load_b_row = threadIdx.x / (BLOCK_N / 4); // 负责的“向量行”索引
+    const uint load_b_col = threadIdx.x % (BLOCK_N / 4); // 负责的“向量列”索引（float4）
+
+    // load_b_row_stride：
+    //   覆盖完整 B tile 时，相邻两轮加载在行方向上的步长（单位：行）
+    //   一轮中每线程加载一个 float4，
+    //   因此一轮可覆盖 NUM_THREADS / (BLOCK_N/4) 行。
     constexpr uint load_b_row_stride = NUM_THREADS / (BLOCK_N / 4);
 
+    // ------------------------------
+    // 7. 寄存器片段：C 累加结果 + A / B 局部 tile
+    // ------------------------------
+    // accum_frag：
+    //   当前线程负责的输出子块累加结果（初始为 0）。
+    //   逻辑维度：
+    //     M 方向：WARP_M_ITER × THREAD_TILE_M
+    //     N 方向：WARP_N_ITER × THREAD_TILE_N
     float accum_frag[WARP_M_ITER * THREAD_TILE_M * WARP_N_ITER * THREAD_TILE_N] = {0.0f};
 
+    // reg_tile_a：
+    //   当前线程在一次 K 子块迭代中从 shared_a 读取的 A 局部片段，
+    //   覆盖自身在 M 方向所有子 tile 迭代对应的 THREAD_TILE_M 行。
     float reg_tile_a[WARP_M_ITER * THREAD_TILE_M] = {0.0f};
+
+    // reg_tile_b：
+    //   当前线程在一次 K 子块迭代中从 shared_b 读取的 B 局部片段，
+    //   覆盖自身在 N 方向所有子 tile 迭代对应的 THREAD_TILE_N 列。
     float reg_tile_b[WARP_N_ITER * THREAD_TILE_N] = {0.0f};
+
+    // 后续：K 方向循环 + shared_a/shared_b 填充 + warp/thread 级乘加累积 + 写回 C
+    // 在完整 kernel 中继续展开。
 }
 
 // 生成测试矩阵大小
