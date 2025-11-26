@@ -1,14 +1,17 @@
-#include <cmath>          // fabsf() 用于结果误差比较
-#include <cublas_v2.h>    // cuBLAS 库头文件，用于调用高性能矩阵乘法
+#include <cmath>          // fabsf()：用于结果误差比较
+#include <cublas_v2.h>    // cuBLAS 库头文件：高性能矩阵运算（列主序接口）
 #include <cuda_runtime.h> // CUDA 运行时 API
-#include <fstream>        // 用于将结果写入 CSV
-#include <iostream>       // 输入输出
+#include <fstream>        // 将结果写入 CSV
+#include <iostream>       // 标准输入输出
 #include <vector>
 
-#define BLOCK_SIZE 128 // 未使用但保留的宏：线程块大小（可用于其他版本）
-#define TOL 1e-5f      // 误差容忍度：用于判断 CPU / GPU 结果是否一致
+#define TOL 1e-5f // 误差容忍度：用于判断 cuBLAS 和自实现 SGEMM 结果是否“一致”（绝对误差比较）
 
-// CUDA 错误检查工具函数：如果 CUDA API 调用失败，打印错误并退出
+// ------------------------------------------------------------
+// CUDA 错误检查工具函数：
+// 1) 包装 CUDA API 返回值检查
+// 2) 如果调用失败，打印错误信息并直接退出进程
+// ------------------------------------------------------------
 void checkCudaError(cudaError_t err, const char* msg)
 {
     if (err != cudaSuccess)
@@ -18,7 +21,11 @@ void checkCudaError(cudaError_t err, const char* msg)
     }
 }
 
-// cuBLAS 错误检查工具函数：检查 cuBLAS API 调用是否成功
+// ------------------------------------------------------------
+// cuBLAS 错误检查工具函数：
+// 1) 包装 cuBLAS API 返回值检查
+// 2) 如果调用失败，打印错误码并直接退出进程
+// ------------------------------------------------------------
 void checkCublasError(cublasStatus_t status, const char* msg)
 {
     if (status != CUBLAS_STATUS_SUCCESS)
@@ -30,138 +37,296 @@ void checkCublasError(cublasStatus_t status, const char* msg)
 
 /*
 ------------------------------------------------------------
-load_from_gmem: 从全局内存加载数据到共享内存
+模块名：load_from_gmem
 ------------------------------------------------------------
+1. 功能：
+   - 从全局内存加载当前 block 负责的 A/B 子块（tile）到共享内存：
+       · A 子块：大小为 BLOCK_M × BLOCK_K，在共享内存中按“转置布局”存储
+                 （逻辑视为 [BLOCK_K][BLOCK_M]），便于后续按 K 维度连续访问。
+       · B 子块：大小为 BLOCK_K × BLOCK_N，在共享内存中保持原 Row-major 布局
+                 （逻辑视为 [BLOCK_K][BLOCK_N]）。
+   - 使用 float4 向量化加载，提升全局内存带宽利用率。
 
-模板参数:
-    BLOCK_M, BLOCK_N, BLOCK_K           : Block级别tile大小
-    row_stride_a, row_stride_b : 加载A和B时的行步长
+2. 模板参数：
+   - BLOCK_M, BLOCK_N, BLOCK_K：
+     Block 级 tile 尺寸，对应：
+       · A tile 大小：BLOCK_M × BLOCK_K
+       · B tile 大小：BLOCK_K × BLOCK_N
+   - load_a_row_stride：
+     A tile 加载行步长（单位：行），即“所有线程一轮加载共同能覆盖的行数”。
+   - load_b_row_stride：
+     B tile 加载行步长（单位：行），含义同上。
 
-函数参数:
-    N, K         : 矩阵维度
-    A, B         : 输入矩阵 (全局内存)
-    As, Bs       : 共享内存中的矩阵缓存
-    inner_row_a, inner_col_a : 当前线程在A tile中的加载位置
-    inner_row_b, inner_col_b : 当前线程在B tile中的加载位置
+3. 函数参数：
+   - N, K：
+     全局矩阵维度（A 为 M×K，B 为 K×N），用于计算线性下标。
+   - A, B：
+     指向当前 block 需要的 A/B 子矩阵首地址（全局内存）。
+     要求：
+       · BLOCK_K 和 BLOCK_N 必须是 4 的倍数，以保证 float4 对齐。
+       · A, B 传入时已按 block 的行/列偏移过。
+   - shared_a, shared_b：
+     共享内存缓冲区：
+       · shared_a 逻辑布局：[BLOCK_K][BLOCK_M]（转置存储）
+       · shared_b 逻辑布局：[BLOCK_K][BLOCK_N]（与原 Row-major 一致）
+   - load_a_row, load_a_vec_col：
+     当前线程在 A tile 中负责加载的“向量行 / 向量列”索引：
+       · load_a_row        ∈ [0, BLOCK_M)
+       · load_a_vec_col    ∈ [0, BLOCK_K/4)
+     每个线程一次加载一个 float4，对应 A 中一行上的 4 个连续元素。
+   - load_b_row, load_b_vec_col：
+     当前线程在 B tile 中负责加载的“向量行 / 向量列”索引：
+       · load_b_row        ∈ [0, BLOCK_K)
+       · load_b_vec_col    ∈ [0, BLOCK_N/4)
 
-算法核心:
-1. 使用float4向量化加载提高内存带宽利用率
-2. 每个线程负责加载一部分数据到共享内存
-3. As采用转置存储以优化后续访问模式
+4. 算法步骤：
+   1) 对于 A：
+        - 按行偏移 row_offset = 0, load_a_row_stride, 2*load_a_row_stride, ... 循环，
+          确保覆盖 BLOCK_M 行。
+        - 每次循环中，每个线程从 A 中加载一段 float4，并在 shared_a 中以
+          “按列（K 维度）为主、按行（M 维度）为次”的方式转置存储，减少后续 bank conflict。
+   2) 对于 B：
+        - 按 row_offset = 0, load_b_row_stride, 2*load_b_row_stride, ... 循环，
+          覆盖 BLOCK_K 行。
+        - 每次循环中，每个线程从 B 中加载一段 float4，并按原 row-major 布局写入 shared_b，
+          方便后续按列方向访问。
+
+5. 使用注意：
+   - 必须保证：
+       · load_a_row_stride > 0 且 load_a_row_stride | BLOCK_M
+       · load_b_row_stride > 0 且 load_b_row_stride | BLOCK_K
+   - A/B 指针传入前已偏移到对应 block 的 tile 左上角，否则会从错误位置加载。
+   - reinterpret_cast<float4*> 访问前提：
+       · A/B/共享内存地址按 16 字节对齐（通常由 cudaMalloc + 合理 tile 尺寸保证）。
 ------------------------------------------------------------
 */
-template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int row_stride_a,
-          const int row_stride_b>
-__device__ void load_from_gmem(int N, int K, const float* A, const float* B, float* As, float* Bs,
-                               int inner_row_a, int inner_col_a, int inner_row_b, int inner_col_b)
+
+template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int load_a_row_stride,
+          const int load_b_row_stride>
+__device__ void load_from_gmem(int N, int K, const float* __restrict__ A,
+                               const float* __restrict__ B, float* __restrict__ shared_a,
+                               float* __restrict__ shared_b, int load_a_row, int load_a_vec_col,
+                               int load_b_row, int load_b_vec_col)
 {
     // ------------------------------
-    // 1. 加载A矩阵tile到共享内存(转置存储)
+    // 1. 加载 A 矩阵 tile 到共享内存（转置存储）
     // ------------------------------
-    for (uint off_set = 0; off_set + row_stride_a <= BLOCK_M; off_set += row_stride_a)
+    // 逻辑视角：
+    //   - 全局 A 子块： [row = 0..BLOCK_M-1][col = 0..BLOCK_K-1]
+    //   - 每个线程：负责某一行 load_a_row 上的第 load_a_vec_col 个 float4
+    //   - 循环 row_offset：在 M 方向上做分片，遍历完整 BLOCK_M 行
+    //
+    // 共享内存布局 shared_a：
+    //   - 视为 [BLOCK_K][BLOCK_M]，行跨度为 BLOCK_M：
+    //       shared_a[k * BLOCK_M + m] = A(m, k)
+    //   - 利用“按 K 为主”的存储，后续按 K 维度遍历时更连续、bank conflict 更少。
+    for (uint row_offset = 0; row_offset + load_a_row_stride <= BLOCK_M;
+         row_offset += load_a_row_stride)
     {
-        // 使用float4向量化加载4个float元素
-        const float4 tmp =
-            reinterpret_cast<const float4*>(&A[(inner_row_a + off_set) * K + inner_col_a * 4])[0];
+        const uint global_row = static_cast<uint>(load_a_row + row_offset); // A 中的行索引
+        const uint global_col_vec = static_cast<uint>(load_a_vec_col);      // float4 列索引
 
-        // 转置存储到共享内存，优化后续访问模式
-        As[(inner_col_a * 4 + 0) * BLOCK_M + inner_row_a + off_set] = tmp.x;
-        As[(inner_col_a * 4 + 1) * BLOCK_M + inner_row_a + off_set] = tmp.y;
-        As[(inner_col_a * 4 + 2) * BLOCK_M + inner_row_a + off_set] = tmp.z;
-        As[(inner_col_a * 4 + 3) * BLOCK_M + inner_row_a + off_set] = tmp.w;
+        // 使用 float4 向量化，从全局内存 A 加载 4 个连续的 float：
+        //   全局下标：global_row * K + global_col_vec * 4 + {0,1,2,3}
+        const float4 a_vec =
+            reinterpret_cast<const float4*>(&A[global_row * K + global_col_vec * 4])[0];
+
+        // 将 A(m, k) 以转置方式写入 shared_a：
+        //   原：A[global_row][global_col_vec * 4 + i]
+        //   目标：shared_a[(global_col_vec * 4 + i) * BLOCK_M + global_row]
+        const uint base_k = global_col_vec * 4;
+        const uint base_m = global_row;
+
+        shared_a[(base_k + 0) * BLOCK_M + base_m] = a_vec.x;
+        shared_a[(base_k + 1) * BLOCK_M + base_m] = a_vec.y;
+        shared_a[(base_k + 2) * BLOCK_M + base_m] = a_vec.z;
+        shared_a[(base_k + 3) * BLOCK_M + base_m] = a_vec.w;
     }
 
     // ------------------------------
-    // 2. 加载B矩阵tile到共享内存(按原始布局存储)
+    // 2. 加载 B 矩阵 tile 到共享内存（保持 row-major 布局）
     // ------------------------------
-    for (uint off_set = 0; off_set + row_stride_b <= BLOCK_K; off_set += row_stride_b)
+    // 逻辑视角：
+    //   - 全局 B 子块： [row = 0..BLOCK_K-1][col = 0..BLOCK_N-1]
+    //   - 每个线程：负责某一行 load_b_row 上的第 load_b_vec_col 个 float4
+    //   - 循环 row_offset：在 K 方向上分片，遍历完整 BLOCK_K 行
+    //
+    // 共享内存布局 shared_b：
+    //   - 视为 [BLOCK_K][BLOCK_N]，与 B 的 row-major 布局一致：
+    //       shared_b[k * BLOCK_N + n] = B(k, n)
+    for (uint row_offset = 0; row_offset + load_b_row_stride <= BLOCK_K;
+         row_offset += load_b_row_stride)
     {
-        // 使用float4向量化加载B矩阵数据
-        reinterpret_cast<float4*>(&Bs[(inner_row_b + off_set) * BLOCK_N + inner_col_b * 4])[0] =
-            reinterpret_cast<const float4*>(&B[(inner_row_b + off_set) * N + inner_col_b * 4])[0];
+        const uint global_row = static_cast<uint>(load_b_row + row_offset); // B 中的行索引
+        const uint global_col_vec = static_cast<uint>(load_b_vec_col);      // float4 列索引
+
+        // 从全局 B 加载 float4：
+        //   全局下标：global_row * N + global_col_vec * 4 + {0,1,2,3}
+        const float4 b_vec =
+            reinterpret_cast<const float4*>(&B[global_row * N + global_col_vec * 4])[0];
+
+        // 直接按 row-major 写入 shared_b，对应：
+        //   shared_b[global_row][global_col_vec * 4 + {0,1,2,3}]
+        reinterpret_cast<float4*>(&shared_b[global_row * BLOCK_N + global_col_vec * 4])[0] = b_vec;
     }
 }
 
 /*
 ------------------------------------------------------------
-process_from_smem: 在共享内存中处理矩阵乘法计算
+模块名：process_from_smem
 ------------------------------------------------------------
+1. 功能：
+   - 在共享内存中的 A / B tile 基础上执行矩阵乘法的核心 FMA 计算：
+       C_warp_tile += A_block_tile × B_block_tile（沿 K 维度展开）
+   - 每个线程：
+       · 从 shared_a / shared_b 中加载自己负责的 A/B 局部片段到寄存器 a_frag / b_frag
+       · 使用寄存器数据对 accum_frag 中的 C 局部结果进行累加。
 
-模板参数:
-    BLOCK_M, BLOCK_N, BLOCK_K     : Block级别tile大小
-    WM, WN         : Warp级别tile大小
-    WMITER, WNITER : Warp内部迭代次数
-    WSUBM, WSUBN   : Warp子tile大小
-    TM, TN         : Thread级别tile大小
+2. 模板参数：
+   - BLOCK_M, BLOCK_N, BLOCK_K：
+     Block 级 tile 尺寸，BLOCK_K 对应当前 K 子块长度。
+   - WARP_M, WARP_N：
+     Warp 级 tile 尺寸：单个 warp 负责的 C 子矩阵大小。
+   - WARP_M_ITER, WARP_N_ITER：
+     Warp 在 M / N 方向上子 tile 的迭代次数：
+       · M 方向总输出：WARP_M = WARP_M_ITER * WARP_SUB_TILE_M
+       · N 方向总输出：WARP_N = WARP_N_ITER * WARP_SUB_TILE_N
+   - WARP_SUB_TILE_M, WARP_SUB_TILE_N：
+     单次迭代时，warp 级子 tile 在 M / N 方向的尺寸。
+   - THREAD_TILE_M, THREAD_TILE_N：
+     单线程在 M / N 方向负责的输出子块尺寸（thread tile）。
 
-函数参数:
-    reg_m, reg_n         : 存放线程从共享内存加载的数据的寄存器
-    thread_results       : 存放线程计算结果的寄存器
-    As, Bs               : 共享内存中的矩阵数据
-    warp_row, warp_col   : 当前warp在block中的行列位置
-    thread_row_in_warp, thread_col_in_warp : 当前线程在warp中的行列位置
+3. 函数参数：
+   - a_frag, b_frag：
+     寄存器缓存：
+       · a_frag 长度：WARP_M_ITER * THREAD_TILE_M
+       · b_frag 长度：WARP_N_ITER * THREAD_TILE_N
+     分别保存当前线程在所有 M/N 子 tile 上的 A/B 扫描值。
+   - accum_frag：
+     寄存器中累加的 C 结果片段，布局为：
+       [WARP_M_ITER * THREAD_TILE_M] × [WARP_N_ITER * THREAD_TILE_N] 拉平的一维数组。
+   - shared_a, shared_b：
+     共享内存中的 A / B tile 数据：
+       · shared_a：逻辑视为 [BLOCK_K][BLOCK_M]，索引方式 k * BLOCK_M + m
+       · shared_b：逻辑视为 [BLOCK_K][BLOCK_N]，索引方式 k * BLOCK_N + n
+   - warp_tile_row, warp_tile_col：
+     当前 warp 在 block 级 C tile 中的 warp 级坐标（单位：WARP_M / WARP_N 元素）。
+   - thread_tile_row, thread_tile_col：
+     当前线程在 warp 子 tile 内的“thread tile 坐标”，决定其负责的 C 局部区域起点。
 
-算法核心:
-1. 沿K维度进行点积计算
-2. 每个线程从共享内存加载数据到寄存器
-3. 在寄存器中进行计算以提高性能
-4. 累加结果到thread_results
+4. 算法步骤：
+   1) 对 K 维度的每一个 k_step（0..BLOCK_K-1）：
+        a. 从 shared_a 中加载当前 k_step 上的 A 行片段到 a_frag：
+             - M 方向按 warp_tile_row / warp_m_iter_idx / thread_tile_row / tti_m 分别定位
+        b. 从 shared_b 中加载当前 k_step 上的 B 行片段到 b_frag：
+             - N 方向按 warp_tile_col / warp_n_iter_idx / thread_tile_col / tti_n 分别定位
+        c. 遍历所有 (warp_m_iter_idx, warp_n_iter_idx, tti_m, tti_n) 组合，
+           执行一次标量 FMA：
+             accum_frag(m, n) += a_frag(m) * b_frag(n)
+   2) 经多个 K 子块迭代后，accum_frag 中即得到当前线程负责的 C 局部最终结果。
+
+5. 使用注意：
+   - shared_a / shared_b 的布局必须与 load_from_gmem 保持一致：
+       · shared_a[k * BLOCK_M + m] 与 A_tile(m, k) 对应
+       · shared_b[k * BLOCK_N + n] 与 B_tile(k, n) 对应
+   - 索引组合：
+       warp_tile_row * WARP_M + warp_m_iter_idx * WARP_SUB_TILE_M
+       + thread_tile_row * THREAD_TILE_M + tti_m
+     必须保证 < BLOCK_M（同理 N 方向 < BLOCK_N），这依赖于模板参数的整除关系。
 ------------------------------------------------------------
 */
-template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int WM, const int WN,
-          const int WMITER, const int WNITER, const int WSUBM, const int WSUBN, const int TM,
-          const int TN>
-__device__ void process_from_smem(float* reg_m, float* reg_n, float* thread_results,
-                                  const float* As, const float* Bs, const uint warp_row,
-                                  const uint warp_col, const uint thread_row_in_warp,
-                                  const uint thread_col_in_warp)
+
+template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int WARP_M,
+          const int WARP_N, const int WARP_M_ITER, const int WARP_N_ITER, const int WARP_SUB_TILE_M,
+          const int WARP_SUB_TILE_N, const int THREAD_TILE_M, const int THREAD_TILE_N>
+__device__ void
+process_from_smem(float* __restrict__ a_frag, float* __restrict__ b_frag,
+                  float* __restrict__ accum_frag, const float* __restrict__ shared_a,
+                  const float* __restrict__ shared_b, const uint warp_tile_row,
+                  const uint warp_tile_col, const uint thread_tile_row, const uint thread_tile_col)
 {
     // ------------------------------
-    // 1. 沿K维度迭代计算点积
+    // 1. 沿 K 维度迭代：对每一个 k_step 做一次“rank-1 更新”
     // ------------------------------
-    for (uint dot_idx = 0; dot_idx < BLOCK_K; ++dot_idx)
+    for (uint k_step = 0; k_step < BLOCK_K; ++k_step)
     {
         // ------------------------------
-        // 2. 加载A矩阵数据到寄存器
+        // 2. 从 shared_a 加载当前 k_step 上的 A 片段到 a_frag
         // ------------------------------
-        for (uint w_sub_row_idx = 0; w_sub_row_idx < WMITER; ++w_sub_row_idx)
+        // shared_a 布局为 [BLOCK_K][BLOCK_M]（K-major）：
+        //   shared_a[k_step * BLOCK_M + row_idx]
+        //
+        // row_idx 由以下部分组成：
+        //   - warp_tile_row * WARP_M              ：当前 warp 在 block 内的 M 起点
+        //   - warp_m_iter_idx * WARP_SUB_TILE_M   ：warp 在 M 方向的迭代偏移
+        //   - thread_tile_row * THREAD_TILE_M     ：当前线程在子 tile 内的起点
+        //   - tti_m                               ：thread tile 内的局部行索引
+        for (uint warp_m_iter_idx = 0; warp_m_iter_idx < WARP_M_ITER; ++warp_m_iter_idx)
         {
-            for (uint i = 0; i < TM; ++i)
+            for (uint tti_m = 0; tti_m < THREAD_TILE_M; ++tti_m)
             {
-                reg_m[w_sub_row_idx * TM + i] =
-                    As[(dot_idx * BLOCK_M) + warp_row * WM + w_sub_row_idx * WSUBM +
-                       thread_row_in_warp * TM + i];
+                const uint row_in_block = warp_tile_row * WARP_M +
+                                          warp_m_iter_idx * WARP_SUB_TILE_M +
+                                          thread_tile_row * THREAD_TILE_M + tti_m;
+
+                a_frag[warp_m_iter_idx * THREAD_TILE_M + tti_m] =
+                    shared_a[k_step * BLOCK_M + row_in_block];
             }
         }
 
         // ------------------------------
-        // 3. 加载B矩阵数据到寄存器
+        // 3. 从 shared_b 加载当前 k_step 上的 B 片段到 b_frag
         // ------------------------------
-        for (uint w_sub_col_idx = 0; w_sub_col_idx < WNITER; ++w_sub_col_idx)
+        // shared_b 布局为 [BLOCK_K][BLOCK_N]（Row-major）：
+        //   shared_b[k_step * BLOCK_N + col_idx]
+        //
+        // col_idx 由以下部分组成：
+        //   - warp_tile_col * WARP_N              ：当前 warp 在 block 内的 N 起点
+        //   - warp_n_iter_idx * WARP_SUB_TILE_N   ：warp 在 N 方向的迭代偏移
+        //   - thread_tile_col * THREAD_TILE_N     ：当前线程在子 tile 内的起点
+        //   - tti_n                               ：thread tile 内的局部列索引
+        for (uint warp_n_iter_idx = 0; warp_n_iter_idx < WARP_N_ITER; ++warp_n_iter_idx)
         {
-            for (uint i = 0; i < TN; ++i)
+            for (uint tti_n = 0; tti_n < THREAD_TILE_N; ++tti_n)
             {
-                reg_n[w_sub_col_idx * TN + i] =
-                    Bs[(dot_idx * BLOCK_N) + warp_col * WN + w_sub_col_idx * WSUBN +
-                       thread_col_in_warp * TN + i];
+                const uint col_in_block = warp_tile_col * WARP_N +
+                                          warp_n_iter_idx * WARP_SUB_TILE_N +
+                                          thread_tile_col * THREAD_TILE_N + tti_n;
+
+                b_frag[warp_n_iter_idx * THREAD_TILE_N + tti_n] =
+                    shared_b[k_step * BLOCK_N + col_in_block];
             }
         }
 
         // ------------------------------
-        // 4. 在寄存器中计算矩阵乘法累加
+        // 4. 在寄存器中执行 FMA：accum_frag += a_frag × b_frag
         // ------------------------------
-        for (uint w_sub_row_idx = 0; w_sub_row_idx < WMITER; ++w_sub_row_idx)
+        // 逻辑上：
+        //   对所有 (warp_m_iter_idx, warp_n_iter_idx, tti_m, tti_n)：
+        //     C_local(m, n) += A_local(m) * B_local(n)
+        //
+        // 累加结果在 accum_frag 中的线性索引为：
+        //   row_idx = warp_m_iter_idx * THREAD_TILE_M + tti_m
+        //   col_idx = warp_n_iter_idx * THREAD_TILE_N + tti_n
+        //   idx     = row_idx * (WARP_N_ITER * THREAD_TILE_N) + col_idx
+        for (uint warp_m_iter_idx = 0; warp_m_iter_idx < WARP_M_ITER; ++warp_m_iter_idx)
         {
-            for (uint w_sub_col_idx = 0; w_sub_col_idx < WNITER; ++w_sub_col_idx)
+            for (uint warp_n_iter_idx = 0; warp_n_iter_idx < WARP_N_ITER; ++warp_n_iter_idx)
             {
-                for (uint res_idx_m = 0; res_idx_m < TM; ++res_idx_m)
+                for (uint tti_m = 0; tti_m < THREAD_TILE_M; ++tti_m)
                 {
-                    for (uint res_idx_n = 0; res_idx_n < TN; ++res_idx_n)
+                    const float a_val = a_frag[warp_m_iter_idx * THREAD_TILE_M + tti_m];
+
+                    for (uint tti_n = 0; tti_n < THREAD_TILE_N; ++tti_n)
                     {
-                        thread_results[(w_sub_row_idx * TM + res_idx_m) * (WNITER * TN) +
-                                       (w_sub_col_idx * TN) + res_idx_n] +=
-                            reg_m[w_sub_row_idx * TM + res_idx_m] *
-                            reg_n[w_sub_col_idx * TN + res_idx_n];
+                        const float b_val = b_frag[warp_n_iter_idx * THREAD_TILE_N + tti_n];
+
+                        const uint row_idx = warp_m_iter_idx * THREAD_TILE_M + tti_m;
+                        const uint col_idx = warp_n_iter_idx * THREAD_TILE_N + tti_n;
+
+                        const uint accum_index = row_idx * (WARP_N_ITER * THREAD_TILE_N) + col_idx;
+
+                        accum_frag[accum_index] += a_val * b_val;
                     }
                 }
             }
@@ -177,56 +342,55 @@ constexpr int WARP_SIZE = 32;
 模块名：mysgemm_warptiling
 ------------------------------------------------------------
 1. 功能：
-   - 使用三层 tiling（Block / Warp / Thread）实现高性能 SGEMM：
+   - 使用三层 tiling（Block / Warp / Thread）实现单精度矩阵乘法：
        C = alpha * A * B + beta * C
-   - 矩阵均为 row-major（行主序）存储。
+   - 适用于 row-major 存储的 A[M×K]、B[K×N]、C[M×N]。
 
 2. 模板参数：
    - BLOCK_M, BLOCK_N, BLOCK_K：
-     Block 级 tile 尺寸。单个 block 负责计算
-     C 的一个 BLOCK_M（行）× BLOCK_N（列）子矩阵，
-     并沿 K 方向以 BLOCK_K 为深度分块累加。
+     Block 级 tile 尺寸。每个 block 负责计算一个 BLOCK_M×BLOCK_N 的 C 子块，
+     并沿 K 方向按 BLOCK_K 分块累加。
    - WARP_M, WARP_N：
-     Warp 级 tile 尺寸。单个 warp 在 block 内负责计算
-     C 的一个 WARP_M × WARP_N 子矩阵。
+     Warp 级 tile 尺寸。每个 warp 负责一个 WARP_M×WARP_N 的 C 子块。
    - WARP_N_ITER：
-     Warp 在 N 方向对子 tile 的迭代次数，
-     用于覆盖完整的 WARP_N 宽度（一次迭代处理 WARP_SUB_TILE_N 列）。
+     Warp 在 N 方向子 tile 的迭代次数。
    - THREAD_TILE_M, THREAD_TILE_N：
-     Thread 级 tile 尺寸。单线程在一次子 tile 迭代中
-     负责输出 THREAD_TILE_M × THREAD_TILE_N 个 C 元素。
+     每个线程在 M / N 方向上负责输出的局部子块尺寸（thread tile）。
    - NUM_THREADS：
-     每个 block 的线程总数，需为 WARP_SIZE 的整数倍，
-     并与 BLOCK/WARP/THREAD tile 的拆分关系匹配。
+     每个 block 的线程总数，要求是 WARP_SIZE(32) 的整数倍。
 
 3. 函数参数：
    - M, N, K：
-     矩阵维度，A[M × K]，B[K × N]，C[M × N]，均为 row-major。
+     矩阵维度：A 为 M×K，B 为 K×N，C 为 M×N，均为 row-major。
    - alpha, beta：
-     标量系数，最终计算：
+     标量系数，最终计算公式为：
        C = alpha * (A * B) + beta * C
    - A, B：
-     输入矩阵首地址（row-major）：
+     输入矩阵首地址，row-major：
        · A 行跨度为 K
        · B 行跨度为 N
    - C：
-     输出/输入矩阵首地址（row-major），行跨度为 N。
+     输出/输入矩阵首地址，row-major，行跨度为 N。
 
-4. 算法步骤（沿 K 方向分块累加）：
-   1) 将 C 按 BLOCK_M × BLOCK_N 划分为 block tile，每个 block 负责一个 tile。
-   2) block 内将该 tile 进一步划分为多个 WARP_M × WARP_N 的 warp tile。
-   3) 对每个 K 分块：
-        a. 所有线程协同将 A 的 BLOCK_M × BLOCK_K 子块、
-           B 的 BLOCK_K × BLOCK_N 子块搬运到共享内存。
-        b. 每个线程从共享内存读取自身负责的 A/B 局部片段到寄存器。
-        c. 在寄存器中完成 FMA 累加，更新本线程的 accum_frag。
-   4) 所有 K 分块累加完毕后，将 accum_frag 按 alpha/beta 写回 C。
+4. 算法步骤（沿 K 分块）：
+   1) 将 C 按 BLOCK_M×BLOCK_N 划分为 block 级 tile，每个 block 负责一个 tile。
+   2) 在 block 内再按 WARP_M×WARP_N 划分为 warp 级 tile，每个 warp 负责一个子块。
+   3) 沿 K 方向以 BLOCK_K 为步长循环：
+        a) 所有线程协同，从全局内存以 float4 向量化方式将
+           当前 BLOCK_M×BLOCK_K 的 A 子块和 BLOCK_K×BLOCK_N 的 B 子块载入 shared memory。
+        b) 每个 warp/线程从 shared memory 中取出属于自己负责的局部 A/B 片段到寄存器，
+           在寄存器中对 accum_frag 执行 FMA 累加。
+   4) 遍历完所有 K 子块后，将 accum_frag 中的结果按 alpha / beta 组合写回到 C。
 
-5. 使用注意：
-   - BLOCK/WARP/THREAD tile 之间需满足整除与覆盖关系，
-     以保证 lane / thread 的映射合法且共享内存访问不越界。
-   - 若使用 float4 向量化加载，A/B 对应地址需保证 16B 对齐，
-     否则会影响性能或触发未对齐访问。
+5. 关键约束与前提：
+   - 保证以下整除关系成立：
+       · BLOCK_M % WARP_M              == 0
+       · BLOCK_N % WARP_N              == 0
+       · WARP_M % (WARP_M_ITER * THREAD_TILE_M) == 0
+       · WARP_N % (WARP_N_ITER * THREAD_TILE_N) == 0
+   - BLOCK_K 和 BLOCK_N 必须是 4 的倍数，以满足 float4 访问对齐要求。
+   - C 的基址 + 每次写回偏移需保持 16 字节对齐，否则 reinterpret_cast<float4*> 存在未对齐访问风险。
+   - THREAD_TILE_N 至少为 4 且为 4 的整数倍（代码内以 tti_n += 4 迭代）。
 ------------------------------------------------------------
 */
 
@@ -245,7 +409,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const uint block_tile_col = blockIdx.y; // block 在 N 方向的 tile 索引
 
     // warp_id_in_block：
-    //   当前线程所在 warp 在 block 内的一维编号（WARP_SIZE=32）
+    //   当前线程所在 warp 在 block 内的一维编号（WARP_SIZE = 32）
     const uint warp_id_in_block = threadIdx.x / WARP_SIZE;
 
     // warps_per_block_n：
@@ -254,7 +418,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const uint warps_per_block_n = BLOCK_N / WARP_N;
 
     // warp_tile_row / warp_tile_col：
-    //   warp 在 block 内的二维 tile 坐标
+    //   warp 在 block 内的二维 tile 坐标（以 warp 级 tile 为单位）
     const uint warp_tile_col = warp_id_in_block % warps_per_block_n; // warp 在 N 方向的序号
     const uint warp_tile_row = warp_id_in_block / warps_per_block_n; // warp 在 M 方向的序号
 
@@ -297,10 +461,12 @@ __global__ void __launch_bounds__(NUM_THREADS)
     // ------------------------------
     // shared_a：
     //   缓存 A 的一个 BLOCK_M × BLOCK_K 子块（row-major 展平）
+    //   几何意义：当前 block 对应的 C 行范围 × 当前 K 子块的列范围
     __shared__ float shared_a[BLOCK_M * BLOCK_K];
 
     // shared_b：
     //   缓存 B 的一个 BLOCK_K × BLOCK_N 子块（row-major 展平）
+    //   几何意义：当前 K 子块的行范围 × 当前 block 对应的 C 列范围
     __shared__ float shared_b[BLOCK_K * BLOCK_N];
 
     // ------------------------------
@@ -308,15 +474,18 @@ __global__ void __launch_bounds__(NUM_THREADS)
     // ------------------------------
     // A 偏移到当前 block 负责的 A tile 左上角：
     //   起始行 = block_tile_row * BLOCK_M，起始列 = 0
+    //   A 为 row-major，行跨度为 K
     A += block_tile_row * BLOCK_M * K;
 
     // B 偏移到当前 block 负责的 B tile 左上角：
     //   起始行 = 0，起始列 = block_tile_col * BLOCK_N
+    //   B 为 row-major，行跨度为 N
     B += block_tile_col * BLOCK_N;
 
     // C 偏移到当前 warp 负责写回的 C warp tile 左上角：
     //   起始行 = block_tile_row * BLOCK_M + warp_tile_row * WARP_M
     //   起始列 = block_tile_col * BLOCK_N + warp_tile_col * WARP_N
+    //   C 为 row-major，行跨度为 N
     C += (block_tile_row * BLOCK_M + warp_tile_row * WARP_M) * N + block_tile_col * BLOCK_N +
          warp_tile_col * WARP_N;
 
@@ -325,13 +494,14 @@ __global__ void __launch_bounds__(NUM_THREADS)
     // ------------------------------
     // 将 BLOCK_M × BLOCK_K 的 A tile 视为：
     //   BLOCK_M 行 × (BLOCK_K / 4) 列 float4 向量
+    // 要求：BLOCK_K % 4 == 0
     const uint load_a_row = threadIdx.x / (BLOCK_K / 4); // 负责的“向量行”索引
     const uint load_a_col = threadIdx.x % (BLOCK_K / 4); // 负责的“向量列”索引（float4）
 
     // load_a_row_stride：
     //   覆盖完整 A tile 时，相邻两轮加载在行方向上的步长（单位：行）
     //   一轮所有线程共加载 NUM_THREADS * 4 个 float，
-    //   按 K 方向长度 BLOCK_K 展开，相当于加载 (NUM_THREADS*4 / BLOCK_K) 行。
+    //   按 K 方向长度 BLOCK_K 展开，相当于加载 (NUM_THREADS * 4 / BLOCK_K) 行。
     constexpr uint load_a_row_stride = (NUM_THREADS * 4) / BLOCK_K;
 
     // ------------------------------
@@ -339,18 +509,25 @@ __global__ void __launch_bounds__(NUM_THREADS)
     // ------------------------------
     // 将 BLOCK_K × BLOCK_N 的 B tile 视为：
     //   BLOCK_K 行 × (BLOCK_N / 4) 列 float4 向量
+    // 要求：BLOCK_N % 4 == 0
     const uint load_b_row = threadIdx.x / (BLOCK_N / 4); // 负责的“向量行”索引
     const uint load_b_col = threadIdx.x % (BLOCK_N / 4); // 负责的“向量列”索引（float4）
 
     // load_b_row_stride：
     //   覆盖完整 B tile 时，相邻两轮加载在行方向上的步长（单位：行）
     //   一轮中每线程加载一个 float4，
-    //   因此一轮可覆盖 NUM_THREADS / (BLOCK_N/4) 行。
-    constexpr uint load_b_row_stride = NUM_THREADS / (BLOCK_N / 4);
+    //   因此一轮可覆盖 NUM_THREADS / (BLOCK_N / 4) 行
+    //   即 (NUM_THREADS * 4 / BLOCK_N) 行。
+    constexpr uint load_b_row_stride = (NUM_THREADS * 4) / BLOCK_N;
 
     // ------------------------------
     // 7. 寄存器片段：C 累加结果 + A / B 局部 tile
     // ------------------------------
+    // 一个 warp 负责的 C tile 大小：
+    //      WARP_M × WARP_N
+    //      这个 tile 又被拆成（逻辑上）WARP_M_ITER × WARP_N_ITER 个子 tile
+    //      每个子 tile 内，每个线程负责 THREAD_TILE_M × THREAD_TILE_N 个输出。
+    //
     // accum_frag：
     //   当前线程负责的输出子块累加结果（初始为 0）。
     //   逻辑维度：
@@ -368,239 +545,399 @@ __global__ void __launch_bounds__(NUM_THREADS)
     //   覆盖自身在 N 方向所有子 tile 迭代对应的 THREAD_TILE_N 列。
     float reg_tile_b[WARP_N_ITER * THREAD_TILE_N] = {0.0f};
 
-    // 后续：K 方向循环 + shared_a/shared_b 填充 + warp/thread 级乘加累积 + 写回 C
-    // 在完整 kernel 中继续展开。
-}
-
-// 生成测试矩阵大小
-std::vector<int> generateSizes()
-{
-    std::vector<int> sizes;
-    for (int i = 256; i <= 8192; i += 256)
+    // ------------------------------
+    // 8. 沿 K 方向按 BLOCK_K 分块累加
+    // ------------------------------
+    // k_iter：当前 K 子块的起始下标（0, BLOCK_K, 2*BLOCK_K, ...）
+    for (uint k_iter = 0; k_iter < (uint)K; k_iter += BLOCK_K)
     {
-        sizes.push_back(i);
+        // 8.1 从全局内存加载当前 K 子块对应的 A/B tile 到 shared memory
+        //     load_from_gmem 内部通常会：
+        //       - 使用 load_a_row/load_a_col 计算每个线程要加载的 A float4 位置
+        //       - 使用 load_b_row/load_b_col 计算每个线程要加载的 B float4 位置
+        //       - 可能包含边界检查（K 不整除 BLOCK_K 或 M/N 不整除 BLOCK_M/BLOCK_N 时）
+        load_from_gmem<BLOCK_M, BLOCK_N, BLOCK_K, load_a_row_stride, load_b_row_stride>(
+            N, K, A, B, shared_a, shared_b, load_a_row, load_a_col, load_b_row, load_b_col);
+        __syncthreads(); // 确保当前 K 子块的 A/B 已全部写入 shared memory
+
+        // 8.2 从 shared memory 读取局部 A/B tile 到寄存器，执行 FMA 累加
+        //     process_from_smem 内部通常会：
+        //       - 以 warp_tile_row/warp_tile_col 定位当前 warp 的 C tile 起点
+        //       - 以 thread_tile_row/thread_tile_col 定位当前线程的 thread tile 起点
+        //       - 遍历 BLOCK_K 维度，对 reg_tile_a / reg_tile_b 进行加载
+        //       - 对 accum_frag 执行多轮 FMA 累加
+        process_from_smem<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_M_ITER, WARP_N_ITER,
+                          WARP_SUB_TILE_M, WARP_SUB_TILE_N, THREAD_TILE_M, THREAD_TILE_N>(
+            reg_tile_a, reg_tile_b, accum_frag, shared_a, shared_b, warp_tile_row, warp_tile_col,
+            thread_tile_row, thread_tile_col);
+
+        // 8.3 全局 A/B 指针推进到下一个 K 子块
+        //     A：按列方向（K 维度）偏移 BLOCK_K
+        A += BLOCK_K;
+        //     B：按行方向偏移 BLOCK_K 行，每行跨度为 N
+        B += BLOCK_K * N;
+
+        __syncthreads(); // 确保所有线程都完成当前子块计算后再加载下一个子块
     }
-    return sizes;
+
+    // ------------------------------
+    // 9. 将寄存器中累加结果按 alpha/beta 写回到 C
+    // ------------------------------
+    // 外层两重循环遍历 warp 在 M/N 方向的子 tile 迭代（WARP_M_ITER × WARP_N_ITER）
+    for (uint warp_m_iter = 0; warp_m_iter < WARP_M_ITER; warp_m_iter++)
+    {
+        for (uint warp_n_iter = 0; warp_n_iter < WARP_N_ITER; warp_n_iter++)
+        {
+            // c_tile_ptr：
+            //   指向当前 warp 子 tile（由 warp_m_iter、warp_n_iter 决定）的 C 子块首地址
+            float* c_tile_ptr =
+                C + (warp_m_iter * WARP_SUB_TILE_M) * N + warp_n_iter * WARP_SUB_TILE_N;
+
+            // 对当前子 tile 内，每个线程负责 THREAD_TILE_M × THREAD_TILE_N 个元素
+            for (uint tti_m = 0; tti_m < THREAD_TILE_M; tti_m++)
+            {
+                // N 方向以 4 为步长做 float4 向量化写回
+                // 要求：THREAD_TILE_N 为 4 的倍数
+                for (uint tti_n = 0; tti_n < THREAD_TILE_N; tti_n += 4)
+                {
+                    // 9.1 从 C 中读取旧值（float4 向量化访问）
+                    //     这里假设：
+                    //       - C 的基址和 (thread_tile_col * THREAD_TILE_N + tti_n) 保证 16B 对齐
+                    float4 old_c_val = reinterpret_cast<float4*>(
+                        &c_tile_ptr[(thread_tile_row * THREAD_TILE_M + tti_m) * N +
+                                    thread_tile_col * THREAD_TILE_N + tti_n])[0];
+
+                    // 9.2 计算当前 4 个输出元素在 accum_frag 中的一维索引基址
+                    const int frag_index =
+                        (warp_m_iter * THREAD_TILE_M + tti_m) * (WARP_N_ITER * THREAD_TILE_N) +
+                        (warp_n_iter * THREAD_TILE_N + tti_n);
+
+                    // 9.3 计算新的输出值：alpha * accum + beta * old_c
+                    float4 out;
+                    out.x = alpha * accum_frag[frag_index + 0] + beta * old_c_val.x;
+                    out.y = alpha * accum_frag[frag_index + 1] + beta * old_c_val.y;
+                    out.z = alpha * accum_frag[frag_index + 2] + beta * old_c_val.z;
+                    out.w = alpha * accum_frag[frag_index + 3] + beta * old_c_val.w;
+
+                    // 9.4 回写到 C（float4 向量化写回）
+                    reinterpret_cast<float4*>(
+                        &c_tile_ptr[(thread_tile_row * THREAD_TILE_M + tti_m) * N +
+                                    thread_tile_col * THREAD_TILE_N + tti_n])[0] = out;
+                }
+            }
+        }
+    }
 }
 
-// 整除向上宏
+// 生成测试矩阵大小：256, 512, ..., 8192
+std::vector<int> generate_test_sizes()
+{
+    std::vector<int> test_sizes;
+    for (int n = 256; n <= 8192; n += 256)
+    {
+        test_sizes.push_back(n);
+    }
+    return test_sizes;
+}
+
+// 整数向上整除：返回 ceil(M / N)
 #define CEIL_DIV(M, N) ((M) + (N) - 1) / (N)
 
+/*
+------------------------------------------------------------
+模块名：主函数 sgemm 基准测试（cuBLAS vs 自实现 SGEMM）
+------------------------------------------------------------
+1. 功能：
+    - 对一组 N×N 单精度矩阵（N ∈ [256, 8192]，步长 256）进行基准测试：
+        · 使用 cuBLAS sgemm 作为参考实现和性能基线
+        · 使用自定义 mysgemm_warptiling kernel 进行性能和正确性对比
+    - 输出字段：
+        Size           : 矩阵边长 N（N×N）
+        CUBLAS_GFLOPS  : cuBLAS 实测 GFLOPS
+        MySGEMM_FLOPS  : 自实现 kernel 实测 GFLOPS
+        Matched        : 结果是否匹配（1=匹配，0=前 N² 元素中存在误差> TOL）
+        Ratio          : 自实现 GFLOPS / cuBLAS GFLOPS
+
+2. 测试策略：
+    - 每个尺寸：
+        · 初始化 host_a/host_b：A 全 1.0f，B 全 2.0f（方便快速检查正确性）
+        · cuBLAS 部分：
+            1) 预热 warmup_iters 次，避免首次调用偏慢
+            2) 计时 timed_iters 次，取总时间计算 GFLOPS
+        · 自实现 kernel 部分：
+            1) 同样 warmup_iters 次预热
+            2) 计时 timed_iters 次，计算 GFLOPS
+            3) 将结果与 cuBLAS 的 C 做逐元素比较（最多统计 10 个误差点）
+
+3. 性能计时：
+    - 使用 cudaEvent_t 进行设备端计时，单位 ms。
+    - GFLOPS 计算公式：
+        总 FLOPs ≈ 2 * N^3 * timed_iters
+        GFLOPS = 总 FLOPs / (time_ms * 1e6)
+------------------------------------------------------------
+*/
 int main()
 {
-    // 生成一组要测试的矩阵尺寸，例如 [256, 512, 768, ..., 8192]
-    std::vector<int> sizes = generateSizes();
+    // 1. 生成测试矩阵尺寸列表
+    std::vector<int> test_sizes = generate_test_sizes();
 
-    // 打开CSV文件，用于记录不同矩阵规模下的性能
-    std::ofstream csv_file("sgemm_benchmark_v7.csv");
-    csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched,Ratio" << std::endl;
+    // 打开 CSV 文件，用于记录不同矩阵规模下的性能数据
+    std::ofstream csv_out("sgemm_benchmark_v5.csv");
+    csv_out << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched,Ratio" << std::endl;
 
-    // 遍历每一个矩阵规模进行测试
-    for (int N : sizes)
+    // 2. 遍历每一个矩阵规模进行测试
+    for (int matrix_size : test_sizes)
     {
-        std::cout << "Testing size: " << N << std::endl;
+        std::cout << "Testing size: " << matrix_size << std::endl;
 
-        // 计算矩阵占用的总字节数（三个 N×N float 矩阵）
-        size_t size = N * N * sizeof(float);
+        // 三个 N×N float 矩阵的字节数（这里只对单个矩阵的 size，后面分别分配）
+        size_t matrix_bytes =
+            static_cast<size_t>(matrix_size) * static_cast<size_t>(matrix_size) * sizeof(float);
 
-        // 在主机端分配内存
-        float* A = (float*)malloc(size);
-        float* B = (float*)malloc(size);
-        float* C_cublas = (float*)malloc(size); // 用于存放 cuBLAS 计算结果
-        float* C_v1 = (float*)malloc(size);     // 用于存放自实现 SGEMM 结果
+        // 2.1 主机端内存分配
+        float* host_a = static_cast<float*>(malloc(matrix_bytes));
+        float* host_b = static_cast<float*>(malloc(matrix_bytes));
+        float* host_c_cublas = static_cast<float*>(malloc(matrix_bytes));    // cuBLAS 结果
+        float* host_c_kernel_v5 = static_cast<float*>(malloc(matrix_bytes)); // 自实现结果
 
-        // 在 GPU 上分配内存
-        float *d_A, *d_B, *d_C_v1;
-        checkCudaError(cudaMalloc(&d_A, size), "cudaMalloc d_A failed");
-        checkCudaError(cudaMalloc(&d_B, size), "cudaMalloc d_B failed");
-        checkCudaError(cudaMalloc(&d_C_v1, size), "cudaMalloc d_C_v1 failed");
+        // 2.2 设备端内存分配
+        float *device_a = nullptr, *device_b = nullptr, *device_c_kernel_v5 = nullptr;
+        checkCudaError(cudaMalloc(&device_a, matrix_bytes), "cudaMalloc device_a failed");
+        checkCudaError(cudaMalloc(&device_b, matrix_bytes), "cudaMalloc device_b failed");
+        checkCudaError(cudaMalloc(&device_c_kernel_v5, matrix_bytes),
+                       "cudaMalloc device_c_kernel_v5 failed");
 
-        bool out_of_memory = false;
+        bool had_error = false;
 
         try
         {
-            // 初始化主机矩阵，这里使用简单常数，方便验证正确性
-            for (int i = 0; i < N * N; ++i)
+            // 2.3 初始化主机矩阵（host_a=1, host_b=2），方便验证正确性
+            for (int i = 0; i < matrix_size * matrix_size; ++i)
             {
-                A[i] = 1.0f;
-                B[i] = 2.0f;
+                host_a[i] = 1.0f;
+                host_b[i] = 2.0f;
             }
 
-            // 把 A、B 复制到 GPU
-            checkCudaError(cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice),
-                           "cudaMemcpy A to device failed");
-            checkCudaError(cudaMemcpy(d_B, B, size, cudaMemcpyHostToDevice),
-                           "cudaMemcpy B to device failed");
+            // 将 A、B 从主机复制到设备
+            checkCudaError(cudaMemcpy(device_a, host_a, matrix_bytes, cudaMemcpyHostToDevice),
+                           "cudaMemcpy host_a to device failed");
+            checkCudaError(cudaMemcpy(device_b, host_b, matrix_bytes, cudaMemcpyHostToDevice),
+                           "cudaMemcpy host_b to device failed");
 
-            // 创建 cuBLAS 句柄
+            // 2.4 创建 cuBLAS 句柄
             cublasHandle_t handle;
             checkCublasError(cublasCreate(&handle), "cublasCreate failed");
 
             float alpha = 1.0f;
             float beta = 0.0f;
 
-            // 创建用于测量 GPU 时间的 event
+            // 2.5 创建 GPU 计时用 event
             cudaEvent_t start, stop;
             checkCudaError(cudaEventCreate(&start), "cudaEventCreate(start) failed");
             checkCudaError(cudaEventCreate(&stop), "cudaEventCreate(stop) failed");
 
-            // -------- Warm-up cuBLAS，避免首次调用偏慢 -------- //
-            int warpup_time = 10; // 热身次数
-            for (int i = 0; i < warpup_time; ++i)
+            // 预热 / 正式计次数（对 cuBLAS 和自定义 kernel 共用）
+            const int warmup_iters = 10; // 预热次数
+            const int timed_iters = 50;  // 正式计时次数
+
+            // ==========================================================
+            // 3. cuBLAS SGEMM 性能与结果（基线）
+            // ==========================================================
+
+            // 3.1 Warm-up cuBLAS，避免首次调用偏慢
+            for (int i = 0; i < warmup_iters; ++i)
             {
-                checkCublasError(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, d_B,
-                                             N, d_A, N, &beta, d_C_v1, N),
-                                 "cublasSgemm failed");
+                checkCublasError(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, matrix_size,
+                                             matrix_size, matrix_size, &alpha, device_b,
+                                             matrix_size,           // B
+                                             device_a, matrix_size, // A
+                                             &beta, device_c_kernel_v5, matrix_size),
+                                 "cublasSgemm warmup failed");
             }
             cudaDeviceSynchronize();
 
-            // -------- 正式计时 cuBLAS -------- //
-            int repeat_time = 5;
+            // 3.2 正式计时 cuBLAS
             checkCudaError(cudaEventRecord(start), "cudaEventRecord(start cublas) failed");
-            for (int i = 0; i < repeat_time; ++i)
+            for (int i = 0; i < timed_iters; ++i)
             {
-                checkCublasError(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, d_B,
-                                             N, d_A, N, &beta, d_C_v1, N),
-                                 "cublasSgemm failed");
+                checkCublasError(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, matrix_size,
+                                             matrix_size, matrix_size, &alpha, device_b,
+                                             matrix_size, device_a, matrix_size, &beta,
+                                             device_c_kernel_v5, matrix_size),
+                                 "cublasSgemm timed failed");
             }
 
             checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop cublas) failed");
             checkCudaError(cudaEventSynchronize(stop), "cudaEventSynchronize cublas failed");
 
             // 计算 cuBLAS 花费时间（毫秒）
-            float cublas_time = 0;
-            checkCudaError(cudaEventElapsedTime(&cublas_time, start, stop),
+            float cublas_time_ms = 0.0f;
+            checkCudaError(cudaEventElapsedTime(&cublas_time_ms, start, stop),
                            "cudaEventElapsedTime cublas failed");
 
-            // 取回 cuBLAS 结果，用于正确性比较
-            checkCudaError(cudaMemcpy(C_cublas, d_C_v1, size, cudaMemcpyDeviceToHost),
-                           "cudaMemcpy C_cublas failed");
+            // 将 cuBLAS 结果拷回主机用于后续正确性比较
+            checkCudaError(
+                cudaMemcpy(host_c_cublas, device_c_kernel_v5, matrix_bytes, cudaMemcpyDeviceToHost),
+                "cudaMemcpy host_c_cublas failed");
 
-            // 清空 C，准备测自实现版本
-            checkCudaError(cudaMemset(d_C_v1, 0, size), "cudaMemset d_C_v1 failed");
+            // 在测自实现 kernel 之前，清空设备端 C 缓冲区
+            checkCudaError(cudaMemset(device_c_kernel_v5, 0, matrix_bytes),
+                           "cudaMemset device_c_kernel_v5 failed");
 
-            // 配置自定义 kernel 的执行参数
-            const uint K10_NUM_THREADS = 128;
-            const uint K10_BN = 128;
-            const uint K10_BM = 128;
-            const uint K10_BK = 16;
-            const uint K10_WN = 64;
-            const uint K10_WM = 64;
-            const uint K10_WNITER = 4;
-            const uint K10_TN = 4;
-            const uint K10_TM = 8;
-            dim3 blockDim(K10_NUM_THREADS);
+            // ==========================================================
+            // 4. 配置并测试自定义 mysgemm_warptiling kernel
+            // ==========================================================
 
-            constexpr uint NUM_WARPS = K10_NUM_THREADS / 32;
+            // 4.1 kernel 配置参数（BLOCK / WARP / THREAD tile 等）
+            const uint KERNEL_NUM_THREADS = 128;
+            const uint BLOCK_N = 128;
+            const uint BLOCK_M = 128;
+            const uint BLOCK_K = 16;
 
-            // 静态断言检查参数配置的正确性
-            static_assert((K10_BN % K10_WN == 0) and (K10_BM % K10_WM == 0));
-            static_assert((K10_BN / K10_WN) * (K10_BM / K10_WM) == NUM_WARPS);
-            static_assert((K10_WM * K10_WN) % (WARP_SIZE * K10_TM * K10_TN * K10_WNITER) == 0);
-            constexpr uint K10_WMITER = (K10_WM * K10_WN) / (32 * K10_TM * K10_TN * K10_WNITER);
-            static_assert((K10_WM % K10_WMITER == 0) and (K10_WN % K10_WNITER == 0));
+            const uint WARP_N = 64;
+            const uint WARP_M = 64;
+            const uint WARP_N_ITER = 4;
 
-            static_assert((K10_NUM_THREADS * 4) % K10_BK == 0,
-                          "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
-                          "issues during GMEM->SMEM tiling (loading only parts of the "
-                          "final row of Bs during each iteraion)");
-            static_assert((K10_NUM_THREADS * 4) % K10_BN == 0,
-                          "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
-                          "issues during GMEM->SMEM tiling (loading only parts of the "
-                          "final row of As during each iteration)");
-            static_assert(K10_BN % (16 * K10_TN) == 0,
-                          "BLOCK_N must be a multiple of 16*TN to avoid quantization effects");
-            static_assert(K10_BM % (16 * K10_TM) == 0,
-                          "BLOCK_M must be a multiple of 16*TM to avoid quantization effects");
-            static_assert((K10_BM * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                          "BLOCK_M*BLOCK_K must be a multiple of 4*256 to vectorize loads");
-            static_assert((K10_BN * K10_BK) % (4 * K10_NUM_THREADS) == 0,
-                          "BLOCK_N*BLOCK_K must be a multiple of 4*256 to vectorize loads");
+            const uint THREAD_TILE_N = 4;
+            const uint THREAD_TILE_M = 8;
 
-            dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(N, K10_BM));
+            dim3 blockDim(KERNEL_NUM_THREADS);
+            constexpr uint NUM_WARPS = KERNEL_NUM_THREADS / WARP_SIZE;
 
-            // -------- Warm-up 自定义 SGEMM -------- //
-            for (int i = 0; i < warpup_time; ++i)
+            // 4.2 静态断言：检查各级 tile 的整除约束与向量化对齐约束
+            static_assert((BLOCK_N % WARP_N == 0) && (BLOCK_M % WARP_M == 0),
+                          "BLOCK_M/BLOCK_N must be integer multiples of WARP_M/WARP_N");
+
+            static_assert((BLOCK_N / WARP_N) * (BLOCK_M / WARP_M) == NUM_WARPS,
+                          "Number of warp tiles per block must equal NUM_WARPS");
+
+            static_assert(
+                (WARP_M * WARP_N) % (WARP_SIZE * THREAD_TILE_M * THREAD_TILE_N * WARP_N_ITER) == 0,
+                "WARP_M * WARP_N must be divisible by warp output per iteration");
+
+            constexpr uint WARP_M_ITER =
+                (WARP_M * WARP_N) / (WARP_SIZE * THREAD_TILE_M * THREAD_TILE_N * WARP_N_ITER);
+
+            static_assert((WARP_M % WARP_M_ITER == 0) && (WARP_N % WARP_N_ITER == 0),
+                          "WARP_M/WARP_N must be divisible by WARP_M_ITER/WARP_N_ITER");
+
+            static_assert((KERNEL_NUM_THREADS * 4) % BLOCK_K == 0,
+                          "NUM_THREADS*4 must be multiple of BLOCK_K "
+                          "to vectorize GMEM->SMEM loads for A");
+
+            static_assert((KERNEL_NUM_THREADS * 4) % BLOCK_N == 0,
+                          "NUM_THREADS*4 must be multiple of BLOCK_N "
+                          "to vectorize GMEM->SMEM loads for B");
+
+            static_assert(BLOCK_N % (16 * THREAD_TILE_N) == 0,
+                          "BLOCK_N must be a multiple of 16*THREAD_TILE_N");
+
+            static_assert(BLOCK_M % (16 * THREAD_TILE_M) == 0,
+                          "BLOCK_M must be a multiple of 16*THREAD_TILE_M");
+
+            static_assert((BLOCK_M * BLOCK_K) % (4 * KERNEL_NUM_THREADS) == 0,
+                          "BLOCK_M*BLOCK_K must be a multiple of 4*NUM_THREADS "
+                          "to vectorize loads for A");
+
+            static_assert((BLOCK_N * BLOCK_K) % (4 * KERNEL_NUM_THREADS) == 0,
+                          "BLOCK_N*BLOCK_K must be a multiple of 4*NUM_THREADS "
+                          "to vectorize loads for B");
+
+            // 4.3 计算网格维度：每个 block 负责 BLOCK_M×BLOCK_N 的 C 子矩阵
+            dim3 gridDim(CEIL_DIV(matrix_size, BLOCK_N), CEIL_DIV(matrix_size, BLOCK_M));
+
+            // 4.4 Warm-up 自定义 SGEMM
+            for (int i = 0; i < warmup_iters; ++i)
             {
-                mysgemm_warptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
-                                   K10_TN, K10_NUM_THREADS>
-                    <<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
+                mysgemm_warptiling<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_N_ITER,
+                                   THREAD_TILE_M, THREAD_TILE_N, KERNEL_NUM_THREADS>
+                    <<<gridDim, blockDim>>>(matrix_size, matrix_size, matrix_size, alpha, device_a,
+                                            device_b, beta, device_c_kernel_v5);
             }
             cudaDeviceSynchronize();
 
-            // -------- 正式计时自实现 SGEMM -------- //
-            checkCudaError(cudaEventRecord(start), "cudaEventRecord(start v1) failed");
-            for (int i = 0; i < repeat_time; ++i)
+            // 4.5 正式计时自实现 SGEMM
+            checkCudaError(cudaEventRecord(start), "cudaEventRecord(start kernel) failed");
+            for (int i = 0; i < timed_iters; ++i)
             {
-                mysgemm_warptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
-                                   K10_TN, K10_NUM_THREADS>
-                    <<<gridDim, blockDim>>>(N, N, N, alpha, d_A, d_B, beta, d_C_v1);
+                mysgemm_warptiling<BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_N_ITER,
+                                   THREAD_TILE_M, THREAD_TILE_N, KERNEL_NUM_THREADS>
+                    <<<gridDim, blockDim>>>(matrix_size, matrix_size, matrix_size, alpha, device_a,
+                                            device_b, beta, device_c_kernel_v5);
             }
-            checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop v1) failed");
-            checkCudaError(cudaEventSynchronize(stop), "cudaEventSynchronize v1 failed");
+            checkCudaError(cudaEventRecord(stop), "cudaEventRecord(stop kernel) failed");
+            checkCudaError(cudaEventSynchronize(stop), "cudaEventSynchronize kernel failed");
             checkCudaError(cudaGetLastError(), "cuda get last error failed");
 
-            float v1_time = 0;
-            checkCudaError(cudaEventElapsedTime(&v1_time, start, stop),
-                           "cudaEventElapsedTime v1 failed");
+            float kernel_time_ms = 0.0f;
+            checkCudaError(cudaEventElapsedTime(&kernel_time_ms, start, stop),
+                           "cudaEventElapsedTime kernel failed");
 
-            // 取回自实现的 C 进行正确性验证
-            checkCudaError(cudaMemcpy(C_v1, d_C_v1, size, cudaMemcpyDeviceToHost),
-                           "cudaMemcpy C_v1 failed");
+            // 将自实现 C 结果拷回主机用于正确性验证
+            checkCudaError(cudaMemcpy(host_c_kernel_v5, device_c_kernel_v5, matrix_bytes,
+                                      cudaMemcpyDeviceToHost),
+                           "cudaMemcpy host_c_kernel_v5 failed");
 
-            // 简单比较前 10 个元素，验证是否数值一致
-            int error_count = 0;
-            for (int i = 0; i < N * N && error_count < 10; ++i)
+            // ==========================================================
+            // 5. 正确性检查与 GFLOPS 计算
+            // ==========================================================
+            int mismatch_count = 0;
+            const int max_mismatches = 10;
+
+            for (int i = 0; i < matrix_size * matrix_size && mismatch_count < max_mismatches; ++i)
             {
-                if (fabsf(C_cublas[i] - C_v1[i]) > TOL)
+                if (fabsf(host_c_cublas[i] - host_c_kernel_v5[i]) > TOL)
                 {
-                    error_count++;
+                    mismatch_count++;
                 }
             }
 
-            // 计算 GFLOPS（公式：2*N³ / 时间）
-            float cublas_gflops = repeat_time * 2.0f * N * N * N / (cublas_time * 1e6f); // GFlops
-            float v1_gflops = repeat_time * 2.0f * N * N * N / (v1_time * 1e6f);         // GFlops
+            float cublas_gflops = timed_iters * 2.0f * matrix_size * matrix_size * matrix_size /
+                                  (cublas_time_ms * 1e6f);
 
-            float ratio = v1_gflops / cublas_gflops;
+            float kernel_gflops = timed_iters * 2.0f * matrix_size * matrix_size * matrix_size /
+                                  (kernel_time_ms * 1e6f);
 
-            // 将结果写入 CSV
-            csv_file << N << "," << cublas_gflops << "," << v1_gflops << ","
-                     << (error_count == 0 ? "1" : "0") << "," << ratio << std::endl;
+            float perf_ratio = kernel_gflops / cublas_gflops;
 
-            // 回收资源
+            // 写入 CSV：Size, cuBLAS, MySGEMM, Matched, Ratio
+            csv_out << matrix_size << "," << cublas_gflops << "," << kernel_gflops << ","
+                    << (mismatch_count == 0 ? "1" : "0") << "," << perf_ratio << std::endl;
+
+            // 6. 清理资源
             cublasDestroy(handle);
             cudaEventDestroy(start);
             cudaEventDestroy(stop);
-            cudaFree(d_A);
-            cudaFree(d_B);
-            cudaFree(d_C_v1);
+            cudaFree(device_a);
+            cudaFree(device_b);
+            cudaFree(device_c_kernel_v5);
 
-            free(A);
-            free(B);
-            free(C_cublas);
-            free(C_v1);
+            free(host_a);
+            free(host_b);
+            free(host_c_cublas);
+            free(host_c_kernel_v5);
             cudaDeviceSynchronize();
         }
         catch (...)
         {
-            // 如果发生内存不足（OOM）则记录并继续下一个尺寸
-            std::cerr << "Out of memory or error during testing size: " << N << std::endl;
-            out_of_memory = true;
+            // 如果发生异常（包括可能的 OOM），记录并继续下一个尺寸
+            std::cerr << "Error or out-of-memory during testing size: " << matrix_size << std::endl;
+            had_error = true;
         }
 
-        if (!out_of_memory)
+        if (!had_error)
         {
-            std::cout << "Finished size: " << N << std::endl;
+            std::cout << "Finished size: " << matrix_size << std::endl;
         }
         else
         {
-            csv_file << N << ",OOM,OOM,0" << std::endl;
+            // 遇到异常时，CSV 中记录为 OOM/ERROR
+            csv_out << matrix_size << ",OOM,OOM,0,0" << std::endl;
         }
     }
 
-    csv_file.close();
+    csv_out.close();
 
-    std::cout << "Benchmark completed. Results saved to 'sgemm_benchmark.csv'" << std::endl;
+    std::cout << "Benchmark completed. Results saved to 'sgemm_benchmark_v5.csv'" << std::endl;
     return 0;
 }
