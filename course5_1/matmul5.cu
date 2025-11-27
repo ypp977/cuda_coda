@@ -100,7 +100,6 @@ void checkCublasError(cublasStatus_t status, const char* msg)
        · A/B/共享内存地址按 16 字节对齐（通常由 cudaMalloc + 合理 tile 尺寸保证）。
 ------------------------------------------------------------
 */
-
 template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int load_a_row_stride,
           const int load_b_row_stride>
 __device__ void load_from_gmem(int N, int K, const float* __restrict__ A,
