@@ -119,8 +119,7 @@ __device__ void load_from_gmem(int N, int K, const float* __restrict__ A,
     //   - 视为 [BLOCK_K][BLOCK_M]，行跨度为 BLOCK_M：
     //       shared_a[k * BLOCK_M + m] = A(m, k)
     //   - 利用“按 K 为主”的存储，后续按 K 维度遍历时更连续、bank conflict 更少。
-    for (uint row_offset = 0; row_offset + load_a_row_stride <= BLOCK_M;
-         row_offset += load_a_row_stride)
+    for (uint row_offset = 0; row_offset + load_a_row_stride <= BLOCK_M;row_offset += load_a_row_stride)
     {
         const uint global_row = static_cast<uint>(load_a_row + row_offset); // A 中的行索引
         const uint global_col_vec = static_cast<uint>(load_a_vec_col);      // float4 列索引
