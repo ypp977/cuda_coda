@@ -21,8 +21,7 @@ void checkCudaError(cudaError_t err, const char* msg)
 {
     if (err != cudaSuccess)
     {
-        std::cerr << msg << " CUDA ERROR: " << cudaGetErrorString(err) << " (" << msg << ")"
-                  << std::endl;
+        std::cerr << "CUDA ERROR: " << msg << " - " << cudaGetErrorString(err) << std::endl;
         exit(EXIT_FAILURE);
     }
 }
@@ -32,7 +31,7 @@ void checkCublasError(cublasStatus_t status, const char* msg)
 {
     if (status != CUBLAS_STATUS_SUCCESS)
     {
-        std::cerr << msg << " CUBLAS ERROR: " << status << std::endl;
+        std::cerr << "CUBLAS ERROR: " << msg << " - status code " << status << std::endl;
         exit(EXIT_FAILURE);
     }
 }
@@ -62,6 +61,12 @@ mysgemm_v4: 手写高性能 SGEMM kernel (C = alpha * A * B + beta * C)
 5. 在寄存器中对线程负责的 C 子块进行累加（accum）。
 6. 沿 K 方向以 BLOCK_K 为步长遍历所有子块。
 7. 最后将寄存器累加结果按 alpha/beta 融合写回全局内存 C。
+
+调用前提（不在 kernel 内做边界检查）：
+- M 是 BLOCK_M 的整数倍，N 是 BLOCK_N 的整数倍，K 是 BLOCK_K 的整数倍；
+- BLOCK_K、THREAD_M、THREAD_N 为 4 的倍数（内部以 4 为步长做 float4 访问）；
+- blockDim.x == (BLOCK_M / THREAD_M) * (BLOCK_N / THREAD_N)；
+- 所有参与 FETCH_FLOAT4 的地址都满足 16 字节对齐。
 ------------------------------------------------------------
 */
 template <const int BLOCK_M, const int BLOCK_N, const int BLOCK_K, const int THREAD_M,
@@ -212,8 +217,7 @@ __global__ void __launch_bounds__(256)
     {
         k += BLOCK_K;
 
-        // ---- 11.1 如果后面还有 K 块，则预先从全局内存加载下一块 A/B 到寄存器 reg_a_vec/reg_b_vec
-        // ----
+        // ---- 11.1 如果后面还有 K 块，则预先从全局内存加载下一块 A/B 到寄存器 ----
         if (k < K)
         {
 #pragma unroll
@@ -240,7 +244,7 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
         for (int bk = 0; bk < BLOCK_K - 1; bk++)
         {
-            // 11.2.1 预取下一 k_inner 的 A 行到寄存器（从共享内存到 reg_a_tile）
+            // 11.2.1 预取下一 k_inner 的 A 行到寄存器
 #pragma unroll
             for (int m = 0; m < THREAD_M; m += 4)
             {
@@ -248,7 +252,7 @@ __global__ void __launch_bounds__(256)
                     FETCH_FLOAT4(shared_a[load_index][OFFSET(bk + 1, local_row_idx + m, BLOCK_M)]);
             }
 
-            // 11.2.2 预取下一 k_inner 的 B 行到寄存器（从共享内存到 reg_b_tile）
+            // 11.2.2 预取下一 k_inner 的 B 行到寄存器
 #pragma unroll
             for (int n = 0; n < THREAD_N; n += 4)
             {
@@ -268,8 +272,7 @@ __global__ void __launch_bounds__(256)
             }
         }
 
-        // ---- 11.3 如果还有下一 K-block，则把 reg_a_vec/reg_b_vec 写入共享内存 write_index 缓冲区
-        // ----
+        // ---- 11.3 如果还有下一 K-block，则把 reg_a_vec/reg_b_vec 写入共享内存 write_index ----
         if (k < K)
         {
 #pragma unroll
@@ -369,6 +372,12 @@ int main()
     std::vector<int> sizes = generateSizes();
 
     // 打开 CSV 文件，用于记录不同矩阵规模下的性能
+    // 列含义：
+    //   Size          : 矩阵边长 N
+    //   CUBLAS_GFLOPS : cuBLAS 实测算力
+    //   MySGEMM_FLOPS : 自实现 kernel 实测算力
+    //   Matched       : 1=在 TOL 内与 cuBLAS 一致，0=存在明显差异
+    //   Ratio         : MySGEMM_FLOPS / CUBLAS_GFLOPS
     std::ofstream csv_file("sgemm_benchmark_v4.csv");
     csv_file << "Size,CUBLAS_GFLOPS,MySGEMM_FLOPS,Matched,Ratio" << std::endl;
 
@@ -424,6 +433,9 @@ int main()
             int warmup_times = 10;
             for (int i = 0; i < warmup_times; i++)
             {
+                // cuBLAS 语义上按列主序解释矩阵，这里输入是行主序；
+                // 由于 A/B 全是常数矩阵，其乘积所有元素相等（2*N），
+                // 因此这种“视图不一致”不会影响结果数值，用作对比是安全的。
                 checkCublasError(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha,
                                              device_a, N, device_b, N, &beta, device_c_v4, N),
                                  "cublasSgemm failed");
@@ -455,7 +467,7 @@ int main()
             checkCudaError(cudaMemset(device_c_v4, 0, size), "cudaMemset device_c_v4 failed");
 
             // 配置自定义 kernel 的执行参数
-            // BLOCK_M = BLOCK_N = 128, THREAD_M = THREAD_N = 8
+            // BLOCK_M = BLOCK_N = 128, THREAD_M = THREAD_N = 8, BLOCK_K = 8
             // gridDim 以 C 的 tile 尺寸 128×128 为单元划分
             dim3 block(256);
             dim3 gridDim(CEIL_DIV(N, 128), CEIL_DIV(N, 128));
@@ -529,13 +541,18 @@ int main()
         }
 
         if (!out_of_memory)
+        {
             std::cout << "Finished size: " << N << std::endl;
+        }
         else
-            csv_file << N << ",OOM,OOM,0" << std::endl;
+        {
+            // OOM 行补齐 Ratio 列，写 0 占位
+            csv_file << N << ",OOM,OOM,0,0" << std::endl;
+        }
     }
 
     csv_file.close();
-    std::cout << "Benchmark completed. Results saved to 'sgemm_benchmarkV4.csv'" << std::endl;
+    std::cout << "Benchmark completed. Results saved to 'sgemm_benchmark_v4.csv'" << std::endl;
 
     return 0;
 }
