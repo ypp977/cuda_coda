@@ -96,7 +96,8 @@ int main()
 
     // 检查 kernel 是否有运行时错误（如非法访问等）
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess){
+    if (err != cudaSuccess)
+    {
         printf("cuda error: %d (%s)\n", err, cudaGetErrorString(err));
     }
 
