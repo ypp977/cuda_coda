@@ -6,7 +6,8 @@ __global__ void race_condition_kernel(int *data) {
     atomicAdd(data, 1);
 }
 
-int main() {
+int main() 
+{
     int *d_data;
     int h_data = 0;
 
