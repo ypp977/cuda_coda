@@ -9,7 +9,8 @@
 
 void row_rmsnorm_f32_dim_cpu(float* in, float* weight, float* out, int batch,
                              int size, float eps) {
-  for (int i = 0; i < batch; ++i) {
+  for (int i = 0; i < batch; ++i) 
+  {
     float* in_ptr = in + i * size;
     float* out_ptr = out + i * size;
 
