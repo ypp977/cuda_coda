@@ -60,6 +60,7 @@ void flash_attention_v2_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n) {
   int SEQLEN = m;
   int DIM = n;
 
+
   int Gc = 1;
   int Gr = (SEQLEN + Br - 1) / Br;
 
