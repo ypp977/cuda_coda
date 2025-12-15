@@ -31,6 +31,7 @@
   } while (0)
 #endif
 
+
 // data type to test
 using FP = float;
 // BLOCK_M(Br, Brow), BLOCK_N(Bc, Bcol) can be determined at compile time
