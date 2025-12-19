@@ -1,2 +1,2 @@
 # cuda_coda
-CUDA学习记录
+CUDA学习
