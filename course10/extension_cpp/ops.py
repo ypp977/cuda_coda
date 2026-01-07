@@ -41,7 +41,6 @@ def _setup_context(ctx, inputs, output):
         saved_a = a
     ctx.save_for_backward(saved_a, saved_b)
 
-
 # This adds training support for the operator. You must provide us
 # the backward formula for the operator and a `setup_context` function
 # to save values to be used in the backward.
